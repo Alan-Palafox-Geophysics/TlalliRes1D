@@ -1,0 +1,27 @@
+# ======================================================================
+# Credenciales y licencias — NUNCA deben subirse al repositorio.
+# Contienen los hashes de contraseña y la clave que firma las cookies.
+# En un despliegue alojado se cargan por st.secrets, no por archivo.
+# ======================================================================
+credenciales.yaml
+**/credenciales.yaml
+.streamlit/secrets.toml
+**/.streamlit/secrets.toml
+
+# Datos de proyectos, entradas y salidas del usuario
+_entradas/
+_exportado/
+**/_entradas/
+**/_exportado/
+proyectos_tre/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+#
+src/inversion_tre_prev.py
