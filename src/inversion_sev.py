@@ -741,9 +741,57 @@ def _arranques_por_division(previo: dict[str, Any], z_fondo: float) -> list[tupl
     return arranques
 
 
+@dataclass
+class RestriccionEspesor:
+    """Espesor mínimo resoluble por un SEV.
+
+    - La primera capa no puede ser más delgada que ``h_min_1`` (la
+      profundidad de investigación de la apertura más corta: nada más
+      somero está muestreado).
+    - Cada capa siguiente debe tener al menos ``fraccion`` × la profundidad
+      de su techo: la resolución vertical del SEV decae con la profundidad
+      y una capa más delgada que eso no se distingue de sus vecinas (queda
+      en equivalencia S o T). ``fraccion = 0`` desactiva esta parte.
+    """
+
+    h_min_1: float
+    fraccion: float = 0.25
+
+    def minimos(self, espesores) -> np.ndarray:
+        h = np.asarray(espesores, float)
+        techos = np.concatenate([[0.0], np.cumsum(h)[:-1]])
+        return np.maximum(np.where(techos > 0, self.fraccion * techos, self.h_min_1), 1e-9)
+
+    def cumple(self, espesores, tolerancia: float = 1e-3) -> bool:
+        h = np.asarray(espesores, float)
+        return bool(len(h) == 0 or np.all(h >= self.minimos(h) * (1 - tolerancia)))
+
+    # Reparametrización: ln z_1 = ln h_min_1 + w_1 y
+    # ln z_i = ln z_{i−1} + ln(1 + fraccion) + w_i, con w ≥ 0. Así cualquier
+    # w ≥ 0 cumple la restricción y el optimizador acotado no puede violarla.
+    def a_w(self, espesores) -> np.ndarray:
+        z = np.cumsum(np.asarray(espesores, float))
+        c = self._c(len(z))
+        lnz = np.log(np.maximum(z, 1e-12))
+        w = np.diff(np.concatenate([[np.log(self.h_min_1)], lnz])) - c
+        return np.maximum(w, 0.0)
+
+    def de_w(self, w) -> np.ndarray:
+        lnz = np.log(self.h_min_1) + np.cumsum(np.asarray(w, float) + self._c(len(w)))
+        return np.diff(np.concatenate([[0.0], np.exp(lnz)]))
+
+    def _c(self, n: int) -> np.ndarray:
+        return np.concatenate([[0.0], np.full(max(n - 1, 0), np.log1p(self.fraccion))])
+
+    def proyectar(self, espesores) -> np.ndarray:
+        """El modelo factible más cercano (en log z) a ``espesores``."""
+        return self.de_w(self.a_w(espesores))
+
+
 def ajustar_bloques_lm(
     geom, rhoa, error_rel, espesores0, resistividades0,
     limites_espesor: tuple[float, float], limites_rho: tuple[float, float], max_nfev: int = 50,
+    restriccion: Optional[RestriccionEspesor] = None,
 ) -> dict[str, Any]:
     """Levenberg–Marquardt acotado (SciPy, región de confianza) para un
     modelo de pocas capas, con el jacobiano analítico en log.
@@ -757,6 +805,11 @@ def ajustar_bloques_lm(
     log_obs = np.log(np.asarray(rhoa, float))
     w = 1.0 / np.asarray(error_rel, float)
     nh = len(espesores0)
+    if restriccion is not None and nh > 0:
+        return _ajustar_bloques_restringido(geom, log_obs, w, rhoa, error_rel, espesores0, resistividades0,
+                                            limites_espesor, limites_rho, max_nfev, restriccion)
+    else:
+        pass
     lh = np.log(limites_espesor)
     lr = np.log(limites_rho)
     x0 = np.concatenate([
@@ -775,6 +828,44 @@ def ajustar_bloques_lm(
     sol = least_squares(residuos, x0, jac=jacobiano, bounds=(inf, sup), method="trf",
                         max_nfev=max_nfev, xtol=1e-10, ftol=1e-12)
     h = np.exp(sol.x[:nh])
+    rho = np.exp(sol.x[nh:])
+    respuesta = fw.respuesta(geom, h, rho)
+    return {"espesores": h, "rho": rho, "respuesta": respuesta,
+            "chi2": _chi2(rhoa, respuesta, error_rel), "rms": _rms(rhoa, respuesta)}
+
+
+def _ajustar_bloques_restringido(geom, log_obs, w, rhoa, error_rel, espesores0, resistividades0,
+                                 limites_espesor, limites_rho, max_nfev, restriccion):
+    """Como :func:`ajustar_bloques_lm`, con el espesor mínimo impuesto por
+    reparametrización (ver :class:`RestriccionEspesor`)."""
+    from scipy.optimize import least_squares
+
+    nh = len(espesores0)
+    lr = np.log(limites_rho)
+    w_max = max(np.log(limites_espesor[1] / restriccion.h_min_1), 1.0)
+    w0 = np.clip(restriccion.a_w(np.asarray(espesores0, float)), 1e-6, w_max - 1e-3)
+    x0 = np.concatenate([w0, np.clip(np.log(np.asarray(resistividades0, float)), lr[0] + 0.01, lr[1] - 0.01)])
+    inf = np.concatenate([np.zeros(nh), np.full(len(resistividades0), lr[0])])
+    sup = np.concatenate([np.full(nh, w_max), np.full(len(resistividades0), lr[1])])
+
+    def residuos(x):
+        return (log_obs - np.log(fw.respuesta(geom, restriccion.de_w(x[:nh]), np.exp(x[nh:])))) * w
+
+    def jacobiano(x):
+        h = restriccion.de_w(x[:nh])
+        z = np.cumsum(h)
+        J = fw.jacobiano_log(geom, h, np.exp(x[nh:]), incluir_espesores=True)
+        Jh = J[:, :nh]                                  # ∂lnρa/∂ln h_i
+        # ∂lnρa/∂ln z_k = J_k·z_k/h_k − J_{k+1}·z_k/h_{k+1}
+        Jz = Jh * (z / h)[None, :]
+        Jz[:, :-1] -= Jh[:, 1:] * (z[:-1] / h[1:])[None, :]
+        # ∂ln z_k/∂w_j = 1 si j ≤ k  →  suma acumulada inversa
+        Jw = np.cumsum(Jz[:, ::-1], axis=1)[:, ::-1]
+        return -np.hstack([Jw, J[:, nh:]]) * w[:, None]
+
+    sol = least_squares(residuos, x0, jac=jacobiano, bounds=(inf, sup), method="trf",
+                        max_nfev=max_nfev, xtol=1e-10, ftol=1e-12)
+    h = restriccion.de_w(sol.x[:nh])
     rho = np.exp(sol.x[nh:])
     respuesta = fw.respuesta(geom, h, rho)
     return {"espesores": h, "rho": rho, "respuesta": respuesta,
@@ -870,6 +961,7 @@ def seleccionar_simplificado(
     verificar_cancelacion: Optional[Callable[[], None]] = None, z_max_datos: Optional[float] = None,
     n_arranques: int = 24, z_min_datos: Optional[float] = None, k_fijo: int = 0,
     modelo_zohdy: Optional[tuple[np.ndarray, np.ndarray]] = None, z_viable: Optional[float] = None,
+    restriccion: Optional[RestriccionEspesor] = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     """Modelo simplificado: Dar Zarrouk + búsqueda multiarranque + BIC.
 
@@ -954,7 +1046,8 @@ def seleccionar_simplificado(
         previos = []
         for h0, r0, etiqueta in arranques:
             try:
-                res = ajustar_bloques_lm(geom, rhoa, error_rel, h0, r0, lim_h, lim_r, max_nfev=8)
+                res = ajustar_bloques_lm(geom, rhoa, error_rel, h0, r0, lim_h, lim_r, max_nfev=8,
+                                         restriccion=restriccion)
             except Exception as exc:
                 logger.debug("Bloques k=%d falló: %s", k, exc)
                 continue
@@ -968,7 +1061,8 @@ def seleccionar_simplificado(
         ajustes = []
         for res in previos[:6]:
             try:
-                fino = ajustar_bloques_lm(geom, rhoa, error_rel, res["espesores"], res["rho"], lim_h, lim_r)
+                fino = ajustar_bloques_lm(geom, rhoa, error_rel, res["espesores"], res["rho"], lim_h, lim_r,
+                                          restriccion=restriccion)
             except Exception as exc:
                 logger.debug("Bloques k=%d (etapa 2) falló: %s", k, exc)
                 continue
@@ -989,7 +1083,8 @@ def seleccionar_simplificado(
         try:
             pulido = invertir_bloques(geom, rhoa, error_rel, mejor_k["espesores"], mejor_k["rho"],
                                       lam=1.0, limites_espesor=lim_h, limites_rho=lim_r)
-            if (mejor_k["chi2"] - pulido["chi2"]) * N > 1.0:
+            factible = restriccion is None or restriccion.cumple(pulido["espesores"])
+            if factible and (mejor_k["chi2"] - pulido["chi2"]) * N > 1.0:
                 for clave_p in ("espesores", "rho", "respuesta", "chi2", "rms"):
                     mejor_k[clave_p] = pulido[clave_p]
             else:
@@ -1022,14 +1117,15 @@ def seleccionar_simplificado(
     else:
         # Parsimonia: el más simple dentro de 2 unidades del mínimo.
         elegido = min((c for c in candidatos if c[clave] <= minimo + 2.0), key=lambda c: c["k"])
-        elegido = _fusionar_similares(geom, rhoa, error_rel, elegido, clave, lim_h, lim_r, candidatos)
+        elegido = _fusionar_similares(geom, rhoa, error_rel, elegido, clave, lim_h, lim_r, candidatos,
+                                      restriccion=restriccion)
     tabla = pd.DataFrame(filas)
     tabla["seleccionado"] = tabla["k"] == elegido["k"]
     return elegido, tabla
 
 
 def _fusionar_similares(geom, rhoa, error_rel, modelo, clave, lim_h, lim_r, candidatos=(),
-                        razon: float = 1.25):
+                        razon: float = 1.25, restriccion: Optional[RestriccionEspesor] = None):
     """Fusiona capas contiguas casi iguales si el criterio no empeora.
 
     El criterio de información puede conservar dos capas contiguas de
@@ -1059,8 +1155,13 @@ def _fusionar_similares(geom, rhoa, error_rel, modelo, clave, lim_h, lim_r, cand
             nuevos_h = np.concatenate([h[:j], [dz["H"]], h[j + 2:]])
             nuevos_rho = np.concatenate([rho[:j], [dz["rho_m"]], rho[j + 2:]])
         try:
-            res = invertir_bloques(geom, rhoa, error_rel, nuevos_h, nuevos_rho,
-                                   limites_espesor=lim_h, limites_rho=lim_r)
+            if restriccion is not None:
+                res = ajustar_bloques_lm(geom, rhoa, error_rel, nuevos_h, nuevos_rho, lim_h, lim_r,
+                                         restriccion=restriccion)
+                res["respuesta"] = fw.respuesta(geom, res["espesores"], res["rho"])
+            else:
+                res = invertir_bloques(geom, rhoa, error_rel, nuevos_h, nuevos_rho,
+                                       limites_espesor=lim_h, limites_rho=lim_r)
         except Exception:
             break
         k = len(res["rho"])
@@ -1197,6 +1298,10 @@ class ConfigInversion:
         Reponderación robusta de datos (IRLS) en la inversión suave.
     k_max : int
         Máximo de capas del modelo simplificado.
+    espesor_min_fraccion : float
+        Espesor mínimo de cada capa del simplificado como fracción de la
+        profundidad de su techo (la primera capa: al menos la profundidad
+        de investigación de la apertura más corta). 0 = sin restricción.
     zohdy : {'ab_n', 'factor_edwards'}
         Profundidad de atribución de Zohdy: z = AB/n con n buscado entre
         ``zohdy_n_min`` y ``zohdy_n_max`` (paso ``zohdy_paso``), evaluando
@@ -1228,6 +1333,7 @@ class ConfigInversion:
     n_arranques: int = 24
     k_fijo: int = 0
     malla: str = "zohdy"
+    espesor_min_fraccion: float = 0.25
     zohdy: str = "ab_n"
     zohdy_n_min: float = 5.0
     zohdy_n_max: float = 8.0
@@ -1353,6 +1459,9 @@ def invertir_sondeo(
         n_arranques=cfg.n_arranques, z_min_datos=float(np.min(datos["z_mediana"])),
         k_fijo=int(cfg.k_fijo), modelo_zohdy=(zoh.espesores, zoh.resistividades),
         z_viable=z_viable if cfg.malla == "zohdy" else None,
+        restriccion=(RestriccionEspesor(h_min_1=float(np.min(datos["z_mediana"])),
+                                        fraccion=float(cfg.espesor_min_fraccion))
+                     if cfg.espesor_min_fraccion > 0 else None),
     )
     cov = covarianza_bloques(geom, simp["espesores"], simp["rho"], error)
 

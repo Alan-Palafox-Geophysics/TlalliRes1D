@@ -98,6 +98,12 @@ with st.container(border=True):
                             help=("Zohdy: el factor de profundidad que ajusta la curva calibra la escala de "
                                   "profundidades; la malla subdivide sus interfaces y termina en la profundidad "
                                   "máxima que los datos pueden ver. El modelo de Zohdy entra exacto como inicial."))
+    ci.espesor_min_fraccion = float(st.slider(
+        "Espesor mínimo de capa del simplificado (fracción de la profundidad de su techo)", 0.0, 1.0,
+        float(getattr(ci, "espesor_min_fraccion", 0.25)), 0.05, key="sl_hmin",
+        help=("Resolución vertical del SEV: una capa más delgada que esta fracción de su profundidad no se "
+              "distingue de sus vecinas. La primera capa, además, no puede ser más delgada que la profundidad "
+              "de investigación de la apertura más corta. 0 = sin restricción (no recomendado).")))
     cz = st.columns([2, 1, 1, 1])
     ZOH = {"ab_n": "Zohdy con z = AB/n (búsqueda de n con resistividades corregidas)",
            "factor_edwards": "Zohdy con factor sobre la profundidad de Edwards (versión previa)"}

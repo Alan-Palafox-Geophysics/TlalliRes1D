@@ -132,9 +132,40 @@ def preparar_crudo(
     K_col = tabla["K"].to_numpy(float)
     rho_col = tabla["ResApp"].to_numpy(float)
     K = tabla["K_geom"].to_numpy(float)
+    if getattr(deteccion, "columna_k", "K") == "R":
+        # K y R intercambiadas en el archivo: la columna R es el factor
+        # geométrico (se usa para el control de calidad de K) y la columna K
+        # no es una resistencia utilizable.
+        K_col, R_col = R_col, np.full(len(tabla), np.nan)
+    else:
+        if getattr(deteccion, "columna_k", "K") == "":
+            K_col = np.full(len(tabla), np.nan)
+        else:
+            pass
 
     hay_vi = np.isfinite(V) & np.isfinite(I) & (I != 0)
     R = np.where(hay_vi, V / np.where(hay_vi, I, 1.0), R_col)
+
+    # ¿La columna V es en realidad la resistencia R = ΔV/I (Ω)? Ocurre con
+    # equipos que exportan la resistencia en la columna de voltaje. Se
+    # reconoce porque ResApp = K·V exactamente y no K·V/I.
+    if hay_vi.sum() >= 3 and np.isfinite(rho_col).sum() >= 3:
+        ok = hay_vi & np.isfinite(rho_col) & (rho_col > 0) & (V > 0) & (K > 0)
+        if ok.sum() >= 3:
+            dif_v = float(np.median(np.abs(np.log(rho_col[ok] / (K[ok] * V[ok])))))
+            razon_vi = float(np.median(rho_col[ok] / (K[ok] * V[ok] / I[ok])))
+            if dif_v < 0.03 and _potencia_diez(razon_vi) == 0 and abs(np.log(razon_vi)) > 0.03:
+                R = np.where(hay_vi, V, R)
+                advertencias.append(
+                    "ResApp del archivo es igual a K·V (no a K·V/I): la columna V contiene la resistencia "
+                    "ΔV/I en Ω, no el voltaje. Se usa V como R."
+                )
+            else:
+                pass
+        else:
+            pass
+    else:
+        pass
 
     # Escala de unidades: si ρa del archivo y K·R difieren en una potencia
     # de diez casi exacta, el problema es de unidades (mV/V, mA/A).

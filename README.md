@@ -50,7 +50,15 @@ columna K** (`geometria_sev.CONVENCIONES`):
 | Polo-dipolo | AB/2 = A–centro de MN (n+½)a · = n·a · = n |
 | Polo-polo | r = AB/2 · = a · = 2·AB/2 |
 
-Sin columna K se usan reglas geométricas y la convención por defecto. El arreglo puede
+Si varias convenciones reproducen K por igual, gana la que lo hace en todas las filas.
+Si siguen empatadas, gana el arreglo que indica la geometría.
+
+Si la columna K no corresponde a ningún arreglo (error mediano > 25 %), no se usa:
+- se prueba si la columna R es el factor geométrico (K y R intercambiadas al exportar);
+- si tampoco, se usan reglas geométricas.
+
+Si ResApp = K·V (y no K·V/I), se interpreta que la columna V trae la resistencia ΔV/I
+en Ω, y se avisa. Sin columna K se usan reglas geométricas y la convención por defecto. El arreglo puede
 forzarse en la pantalla 1.
 
 ## Decisiones técnicas
@@ -153,6 +161,17 @@ Cada arranque se ajusta con Levenberg–Marquardt acotado (SciPy, jacobiano anal
 Se hace en dos etapas: todos los arranques con 8 evaluaciones, y los 6 mejores hasta
 converger. Eso reduce el tiempo a la mitad (30–45 s por sondeo) sin cambiar el
 resultado. El elegido se pule con la inversión de bloques de pyGIMLi.
+
+**Espesor mínimo.** El simplificado no acepta capas que el SEV no puede resolver:
+- la primera capa mide al menos la profundidad de investigación de la apertura más
+  corta;
+- cada capa siguiente mide al menos una fracción (25 % por omisión, ajustable) de la
+  profundidad de su techo.
+
+La restricción va dentro del ajuste, no como filtro posterior. Las interfaces se
+parametrizan como ln z₁ = ln h_min + w₁ y ln zᵢ = ln zᵢ₋₁ + ln(1 + f) + wᵢ, con w ≥ 0,
+y el jacobiano se transforma analíticamente. El pulido con pyGIMLi y la fusión de capas
+solo se aceptan si cumplen la restricción.
 
 **Equivalencia.** Entre los ajustes que explican los datos igual de bien (Δφ ≤ 0.25),
 se queda el más parecido al multicapa. La comparación se pondera por la sensibilidad de

@@ -314,8 +314,32 @@ def prueba_sin_ruido_modelo_b():
     s = inv.invertir_sondeo(proc).simplificado
     assert len(s) == 6, s
     assert np.allclose(s["z_base"].to_numpy()[:5], [5, 15, 30, 50, 80], rtol=0.1), s
-    assert np.allclose(s["rho"].to_numpy(), [50, 100, 20, 60, 10, 75], rtol=0.15), s
+    rho = s["rho"].to_numpy()
+    assert np.allclose(rho[[0, 1, 2, 3, 5]], [50, 100, 20, 60, 75], rtol=0.15), s
+    # Conductor de 50–80 m: los datos fijan su conductancia (30 m / 10 Ω·m = 3 S).
+    assert abs(s["espesor"].iloc[4] / s["rho"].iloc[4] / 3.0 - 1.0) < 0.1, s
     assert np.allclose(s["m_ip"].to_numpy(), [10, 6, 20, 8, 25, 7], atol=2.0), s
+
+
+def prueba_columnas_intercambiadas():
+    """Archivo real de usuario: la columna K trae I/V, la columna R trae el
+    factor geométrico y la columna V la resistencia ΔV/I. La app debe
+    detectarlo, usar la K de la posición real de los electrodos y
+    reproducir el ResApp del archivo."""
+    d = pd.DataFrame(dict(
+        Sondeo="U", Direccion="E", ID=range(1, 9), a=[0.6, 1, 1.4, 2, 3, 4, 5, 7],
+        AB2=[0.8, 1.5, 2.2, 3, 4.5, 6, 7.5, 10.5], MN2=[0.2, 0.5, 0.8, 1, 1.5, 2, 2.5, 3.5],
+        K=[42.81, 42.41, 45.78, 47.74, 51.59, 52.66, 49.9, 48.88],
+        I=[317.28, 199.71, 192.86, 187.72, 183.13, 175.38, 158.11, 135.58],
+        V=[7.4114, 4.709, 4.2128, 3.9321, 3.5497, 3.3304, 3.1685, 2.7737],
+        R=[4.7124, 6.2832, 8.2467, 12.5664, 18.8496, 25.1327, 31.4159, 43.9823],
+        ResApp=[34.9252, 29.5877, 34.7413, 49.4126, 66.9106, 83.7026, 99.5425, 121.9951], IP=0.0))
+    d["tiene_ip"] = False
+    tabla, det, _, adv = pr.preparar_crudo(d)
+    assert det.columna_k == "R", det
+    assert np.allclose(tabla["K_geom"], d["R"], rtol=1e-3), tabla["K_geom"]
+    assert np.allclose(tabla["rhoa"], d["ResApp"], rtol=1e-3), tabla["rhoa"]
+    assert any("la columna V contiene la resistencia" in a for a in adv), adv
 
 
 def prueba_lci():

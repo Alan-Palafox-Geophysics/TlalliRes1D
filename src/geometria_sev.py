@@ -77,6 +77,9 @@ ARREGLOS: dict[str, str] = {
 #: Error mediano de K (relativo) por debajo del cual la detección se
 #: considera confirmada por el archivo.
 TOLERANCIA_K = 0.03
+#: Error mediano (en ln K) por encima del cual la columna K del archivo no
+#: se considera un factor geométrico: se ignora para detectar el arreglo.
+UMBRAL_K_CONFIABLE = 0.25
 
 
 def _valido(x: np.ndarray) -> np.ndarray:
@@ -317,6 +320,9 @@ class Deteccion:
     error_k: float
     confirmada: bool
     mensaje: str
+    #: Columna del archivo que contiene el factor geométrico ("K", "R", o
+    #: "" si ninguna lo reproduce y se usó la geometría).
+    columna_k: str = "K"
 
     def as_dict(self) -> dict:
         return {
@@ -326,8 +332,16 @@ class Deteccion:
         }
 
 
-def _error_k(df: pd.DataFrame, conv: Convencion) -> float:
-    k_col = df["K"].to_numpy(float)
+def _error_k_max(df: pd.DataFrame, conv: Convencion, columna: str = "K") -> float:
+    """Peor error (ln K) entre la columna y la geometría, fila por fila."""
+    k_col = df[columna].to_numpy(float)
+    k_geo = geometria(df, conv.arreglo, conv.clave)["K_geom"].to_numpy(float)
+    ok = _valido(k_col) & _valido(k_geo)
+    return float(np.max(np.abs(np.log(k_col[ok] / k_geo[ok])))) if ok.any() else float("nan")
+
+
+def _error_k(df: pd.DataFrame, conv: Convencion, columna: str = "K") -> float:
+    k_col = df[columna].to_numpy(float)
     if not _valido(k_col).any():
         return float("nan")
     else:
@@ -375,23 +389,38 @@ def detectar_arreglo(df: pd.DataFrame, forzado: Optional[str] = None) -> Detecci
         sus convenciones.
     """
     candidatos = [c for c in CONVENCIONES if forzado in (None, "", "AUTO") or c.arreglo == forzado]
-    errores = [(c, _error_k(df, c)) for c in candidatos]
-    con_k = [(c, e) for c, e in errores if np.isfinite(e)]
 
-    if con_k:
-        mejor, error = min(con_k, key=lambda par: par[1])
-        # Un Wenner es geométricamente un Schlumberger con MN = AB/3: ambos
-        # reproducen K igual de bien. En el empate se prefiere Wenner, que
-        # es lo que se midió (y no tiene tramos de MN que empalmar).
-        if mejor.arreglo == "SCH":
-            for conv, err in con_k:
-                if conv.arreglo == "WE" and err <= error + 1e-3:
-                    mejor, error = conv, err
-                    break
-                else:
-                    pass
+    def elegir(columna: str):
+        errores = [(c, _error_k(df, c, columna)) for c in candidatos]
+        con_k = [(c, e) for c, e in errores if np.isfinite(e)]
+        if not con_k:
+            return None, float("nan")
         else:
             pass
+        error_min = min(e for _, e in con_k)
+        # Empates: varias convenciones dan la misma K (Wenner y polo-polo con
+        # r = a dan 2πa; Wenner es un Schlumberger con MN = AB/3). Entre las
+        # que reproducen K igual de bien en la mediana se prefiere (1) la que
+        # lo reproduce en **todas** las filas (si alguna lectura no tiene
+        # geometría Wenner exacta, la posición real de los electrodos AB/2,
+        # MN/2 es la buena) y (2) el arreglo que indica la geometría de las
+        # distancias, con Wenner antes que Schlumberger.
+        empatadas = [(c, e) for c, e in con_k if e <= error_min + 1e-3]
+        preferido = _regla_geometrica(df)
+        orden = {preferido: 0, "WE": 1, "SCH": 2}
+
+        def clave_orden(par):
+            conv, err = par
+            return (round(_error_k_max(df, conv, columna), 3), orden.get(conv.arreglo, 3), err)
+
+        mejor, error = min(empatadas, key=clave_orden)
+        return mejor, error
+
+    if "K" in df and _valido(df["K"].to_numpy(float)).any():
+        mejor, error = elegir("K")
+    else:
+        mejor, error = None, float("nan")
+    if mejor is not None and error <= UMBRAL_K_CONFIABLE:
         confirmada = error <= TOLERANCIA_K
         if confirmada:
             mensaje = (f"{ARREGLOS[mejor.arreglo]} ({mejor.descripcion}): la geometría "
@@ -401,6 +430,37 @@ def detectar_arreglo(df: pd.DataFrame, forzado: Optional[str] = None) -> Detecci
                        f"{ARREGLOS[mejor.arreglo]}, {mejor.descripcion}, error "
                        f"{100 * error:.0f} %). Revise K o fuerce el arreglo.")
         return Deteccion(mejor.arreglo, mejor.clave, float(error), confirmada, mensaje)
+    else:
+        pass
+
+    # La columna K no es un factor geométrico (o no existe). ¿Está K en otra
+    # columna? Un intercambio de columnas K ↔ R es frecuente al exportar.
+    if mejor is not None:
+        if "R" in df and _valido(df["R"].to_numpy(float)).any():
+            mejor_r, error_r = elegir("R")
+        else:
+            mejor_r, error_r = None, float("nan")
+        if mejor_r is not None and error_r <= TOLERANCIA_K:
+            return Deteccion(
+                mejor_r.arreglo, mejor_r.clave, float(error_r), True,
+                f"La columna K no es un factor geométrico (error mediano {100 * error:.0f} % con cualquier "
+                f"arreglo), pero la columna R sí lo es: {ARREGLOS[mejor_r.arreglo]} "
+                f"({mejor_r.descripcion}), error {100 * error_r:.1f} %. Parece que K y R están "
+                "intercambiadas en el archivo; se usa R como K.",
+                columna_k="R",
+            )
+        else:
+            pass
+        arreglo = forzado if forzado in ARREGLOS else _regla_geometrica(df)
+        clave = CONVENCION_DEFECTO[arreglo]
+        conv = buscar_convencion(arreglo, clave)
+        return Deteccion(
+            arreglo, clave, float(error), False,
+            f"La columna K no corresponde a ningún arreglo (mejor error mediano {100 * error:.0f} %): se "
+            f"ignora y se asume {ARREGLOS[arreglo]} ({conv.descripcion}) por la geometría de AB/2, MN/2 y a. "
+            "Revise el contenido de la columna K.",
+            columna_k="",
+        )
     else:
         pass
 
