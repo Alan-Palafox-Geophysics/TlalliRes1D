@@ -217,9 +217,74 @@ def prueba_empalme_significativo():
     assert informe and informe[0]["aplicado"] and abs(informe[0]["factor"] - 0.8) < 0.1
 
 
+def _procesar(df, config=None):
+    tabla, det, _, _ = pr.preparar_crudo(df)
+    tabla, _ = pr.corregir_empalmes(tabla, arreglo=det.arreglo)
+    prom, _, _ = pr.promediar_direcciones(tabla)
+    return pr.preprocesar(prom, config, arreglo=det.arreglo)
+
+
+def prueba_dos_direcciones_media_geometrica():
+    """Con 2 direcciones no se descarta ninguna: media geométrica y la
+    discrepancia solo eleva el error del dato."""
+    df = _tabla_sintetica([3, 10], [50, 10, 200], ruido=0.01, semilla=3)
+    fila = df.index[df["Direccion"] == "EW"][12]
+    df.loc[fila, ["ResApp", "V", "R"]] *= 1.5
+    proc, met, _ = _procesar(df)
+    assert met["n_direcciones_descartadas"] == 0
+    ab = df.loc[fila, "AB2"]
+    i = int(np.argmin(np.abs(proc["AB2"] - ab) + 100 * (proc["MN2"] != df.loc[fila, "MN2"])))
+    assert proc["error_rel"].iloc[i] >= 0.9 * proc["sigma_dir"].iloc[i] / np.sqrt(2), proc.iloc[i]
+
+
+def prueba_tres_direcciones_descarta_discrepante():
+    df = _tabla_sintetica([3, 10], [50, 10, 200], ruido=0.01, semilla=5, direcciones=("NS", "EW", "NE"))
+    fila = df.index[df["Direccion"] == "NE"][12]
+    df.loc[fila, ["ResApp", "V", "R"]] *= 3.0
+    proc, met, _ = _procesar(df)
+    assert met["n_direcciones_descartadas"] >= 1, met
+    assert proc["motivo"].str.contains("NE").any()
+
+
+def prueba_escala_campana():
+    """Un salto moderado en un sondeo muy limpio es anómalo frente a su
+    propio sondeo, pero no si la campaña entera tiene esa dispersión."""
+    df = _tabla_sintetica([3, 10], [50, 10, 200], ruido=0.003, semilla=7)
+    for fila in df.index[df["ID"] == 14]:
+        df.loc[fila, ["ResApp", "V", "R"]] *= 1.2
+    _, met_solo, _ = _procesar(df)
+    _, met_camp, _ = _procesar(df, pr.ConfigPreproceso(escala_campana=0.15))
+    assert met_solo["n_anomalos"] >= 1 and met_camp["n_anomalos"] == 0, (met_solo, met_camp)
+    assert met_solo["escala_residual"] > 0
+
+
+def prueba_solo_resapp():
+    """Archivo con solo AB/2, MN/2 y ResApp: no se recalcula nada."""
+    ab2 = [1, 2, 3, 5, 8, 13, 20, 30]
+    texto = "AB_2\tMN_2\tAppRes\n" + "\n".join(f"{x}\t0.5\t{10 + x * 1.5:.2f}" for x in ab2)
+    df = lec.leer_sev(texto.encode())
+    tabla, _, _, _ = pr.preparar_crudo(df)
+    assert np.allclose(tabla.sort_values("AB2")["rhoa"].to_numpy(), [10 + x * 1.5 for x in ab2], rtol=1e-6)
+
+
 # ----------------------------------------------------------------------
 # Inversión
 # ----------------------------------------------------------------------
+
+
+def prueba_modo_profundidad():
+    """Bloques por profundidad: k capas log-uniformes hasta la profundidad
+    de Edwards, ρ inicial = media de ρa en cada rango; luego se invierte."""
+    if RAPIDO:
+        return
+    else:
+        pass
+    df = _tabla_sintetica([3, 10], [50, 10, 200], ruido=0.0, direcciones=("NS",))
+    proc, _, _ = _procesar(df)
+    cfg = inv.ConfigInversion(modo_bloques="profundidad", k_profundidad=3, n_trials=4, n_trials_bloques=12)
+    r = inv.invertir_sondeo(proc, cfg)
+    assert len(r.simplificado) == 3, r.simplificado
+    assert r.metricas["simplificado_chi2"] < 5, r.metricas
 
 
 def prueba_dar_zarrouk_conserva_s_t():
@@ -283,8 +348,12 @@ def prueba_sin_ruido_detecta_capas():
     assert met["n_anomalos"] == 0
     s = inv.invertir_sondeo(proc).simplificado
     assert 5 <= len(s) <= 8, s
+    # Las dos primeras interfaces están resueltas; la base del conductor
+    # (20 m) no: el conductor es equivalente por S (h/ρ), así que solo se
+    # exige que esté entre su techo y el doble.
     interfaces = s["z_base"].to_numpy()[:3]
-    assert np.allclose(interfaces, [2, 10, 20], rtol=0.15), interfaces
+    assert np.allclose(interfaces[:2], [2, 10], rtol=0.15), interfaces
+    assert 11 < interfaces[2] < 30, interfaces
     # Resistivo de 20–40 m: los datos fijan su resistencia transversal
     # (T = 20 m × 300 Ω·m = 6000 Ω·m²), no h y ρ por separado.
     assert abs(s["espesor"].iloc[3] * s["rho"].iloc[3] / 6000.0 - 1.0) < 0.15, s
@@ -391,6 +460,14 @@ def prueba_pipeline_y_paquete():
         estado = pl.estado_sondeo(proyecto, "S2")
         assert estado["procesado"]
         assert alm.listar_sondeos(proyecto).set_index("sondeo").loc["S2", "arreglo"] == "WE"
+        # Segunda pasada: el preprocesamiento usó la escala de la campaña.
+        assert (pl.metrica(proyecto, "S1", "procesado", "escala_campana") or 0) > 0
+        # Parámetros de campaña: guardar y volver a cargar.
+        cfg.inversion.zohdy = "rango"
+        cfg.inversion.modo_bloques = "profundidad"
+        pl.guardar_parametros(proyecto, cfg)
+        leida = pl.cargar_parametros(proyecto)
+        assert leida.inversion.zohdy == "rango" and leida.inversion.modo_bloques == "profundidad"
         if not RAPIDO:
             assert all(estado.values())
             assert acc.accion_unidades(proyecto)

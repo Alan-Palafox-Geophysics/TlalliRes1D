@@ -936,10 +936,12 @@ def distancia_al_multicapa(espesores, resistividades, espesores_mc, rho_mc, z_to
 
 def _elegir_equivalente(ajustes: list[dict[str, Any]], n_datos: int, espesores_mc, rho_mc,
                         z_tope: float, tolerancia_phi: float = 0.25,
-                        sensibilidad: Optional[np.ndarray] = None) -> dict[str, Any]:
+                        sensibilidad: Optional[np.ndarray] = None,
+                        criterio_desempate: str = "estructura") -> dict[str, Any]:
     """Entre los ajustes de k capas que explican los datos igual de bien
-    (φ dentro de ``tolerancia_phi`` = 0.25 del mejor, ≈ medio σ), elige el más parecido al
-    multicapa.
+    (φ dentro de ``tolerancia_phi`` = 0.25 del mejor, ≈ medio σ), elige el de
+    mínima estructura (contrastes menos extremos; por omisión) o el más
+    parecido al multicapa.
 
     Es la forma de resolver la **equivalencia**: una capa conductora
     delgada y muy conductora y otra más gruesa y menos conductora con la
@@ -951,9 +953,330 @@ def _elegir_equivalente(ajustes: list[dict[str, Any]], n_datos: int, espesores_m
     for a in equivalentes:
         a["distancia_multicapa"] = distancia_al_multicapa(a["espesores"], a["rho"], espesores_mc, rho_mc, z_tope,
                                                           sensibilidad)
-    elegido = min(equivalentes, key=lambda a: a["distancia_multicapa"])
+        # Estructura: suma de los saltos² de ln ρ entre capas contiguas.
+        a["estructura"] = float(np.sum(np.diff(np.log(np.asarray(a["rho"], float))) ** 2))
+    if criterio_desempate == "estructura":
+        # Mínima estructura: entre variantes equivalentes (misma S o T), la de
+        # contrastes menos extremos — la más conservadora geológicamente.
+        elegido = min(equivalentes, key=lambda a: a["estructura"])
+    else:
+        elegido = min(equivalentes, key=lambda a: a["distancia_multicapa"])
     elegido["n_equivalentes"] = len(equivalentes)
     return elegido
+
+
+def modelo_por_profundidad(k: int, z_e: np.ndarray, rhoa: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Modelo inicial de k capas que depende solo de la profundidad.
+
+    Las k − 1 interfaces dividen de forma logarítmicamente uniforme el
+    intervalo de profundidades de investigación de Edwards
+    [z_e mín, z_e máx]; la resistividad inicial de cada capa es la media
+    geométrica de las ρa cuya z_e cae dentro de ella (si ninguna cae, la
+    del dato más cercano).
+    """
+    z_e = np.asarray(z_e, float)
+    rhoa = np.asarray(rhoa, float)
+    bordes = np.exp(np.linspace(np.log(z_e.min()), np.log(z_e.max()), k + 1))[1:k]
+    limites = np.concatenate([[0.0], bordes, [np.inf]])
+    rho = np.empty(k)
+    for i in range(k):
+        dentro = (z_e >= limites[i]) & (z_e < limites[i + 1])
+        if dentro.any():
+            rho[i] = float(np.exp(np.mean(np.log(rhoa[dentro]))))
+        else:
+            centro = np.sqrt(max(limites[i], z_e.min()) * min(limites[i + 1], z_e.max()))
+            rho[i] = float(rhoa[np.argmin(np.abs(np.log(z_e / centro)))])
+    return np.diff(np.concatenate([[0.0], bordes])), rho
+
+
+def invertir_bloques_optuna(
+    geom, rhoa, error_rel, fuentes: dict[str, tuple[np.ndarray, np.ndarray]],
+    espesores_mc, rho_mc, *, k_max: int = 8, k_fijo: int = 0, criterio: str = "BIC",
+    n_trials: int = 40, restriccion: Optional[RestriccionEspesor] = None,
+    z_max_datos: Optional[float] = None, z_min_datos: Optional[float] = None, z_viable: Optional[float] = None,
+    modo: str = "dar_zarrouk", z_e: Optional[np.ndarray] = None, verificar_cancelacion=None,
+    semilla: int = 42, n_exploratorios: int = 10,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, list[str]]:
+    """Pasos 3 y 4: modelo de bloques inicial y su inversión optimizada.
+
+    **Paso 3 (modo ``'dar_zarrouk'``).** Cada fuente (Zohdy y multicapa) se
+    reduce por Dar Zarrouk a 2…k capas (variantes clásica y con espesor
+    conservado); cada reducción se ajusta brevemente y se queda la fuente
+    cuyo mejor modelo tiene el menor criterio de información.
+    (Modo ``'profundidad'``: el arranque es :func:`modelo_por_profundidad`
+    con el k del usuario.)
+
+    **Paso 4.** Optuna (TPE) explora los hiperparámetros de la inversión de
+    bloques desde ese arranque: número de capas k, variante del arranque
+    (Dar Zarrouk clásico / espesor conservado de la fuente elegida, de la
+    otra fuente, o posiciones de interfaces exploratorias), escala de las
+    profundidades del arranque y "contraste" del arranque
+    (ρ = ρ̄·(ρ/ρ̄)^γ, que recorre la equivalencia S/T entre variantes más o
+    menos extremas). Cada prueba se invierte por Levenberg–Marquardt con el
+    espesor mínimo impuesto y se califica con BIC (o AIC). Al final: k por
+    criterio de información con parsimonia, desempate entre modelos
+    equivalentes, pulido con pyGIMLi y fusión de capas casi iguales.
+
+    Returns
+    -------
+    (mejor, tabla_k, pruebas, proceso)
+    """
+    import optuna
+
+    N = len(rhoa)
+    rhoa = np.asarray(rhoa, float)
+    error_rel = np.asarray(error_rel, float)
+    k_lim = int(min(k_max, (N - 1) // 2))
+    if k_lim < 2:
+        raise InversionSEVError(f"Con {N} datos no se puede ajustar un modelo de 2 capas o más.")
+    else:
+        pass
+    techos_mc = np.cumsum(espesores_mc)
+    z_fondo = float(z_viable) if z_viable else (2.0 * float(z_max_datos) if z_max_datos else float(techos_mc[-1]))
+    lim_h = (max(float(espesores_mc[0]) / 20.0, 1e-3), z_fondo)
+    lim_r = (max(float(np.min(rhoa)) / 20.0, RHO_MIN), min(float(np.max(rhoa)) * 20.0, RHO_MAX))
+    z_sup = float(z_viable) if z_viable else (1.5 * float(z_max_datos) if z_max_datos else float(techos_mc[-1]) / 2)
+    z_inf = 0.5 * float(z_min_datos) if z_min_datos else float(espesores_mc[0])
+    z_busqueda = (max(z_inf, lim_h[0] * 2.0), max(z_sup, 2.0 * z_inf))
+    proceso: list[str] = []
+    clave_ic = "AIC" if criterio == "AIC" else "BIC"
+
+    def criterio_de(chi2: float, k: int) -> float:
+        p = 2 * k - 1
+        phi = chi2 * N
+        return phi + p * np.log(N) if clave_ic == "BIC" else phi + 2 * p + 2 * p * (p + 1) / max(N - p - 1, 1)
+
+    if k_fijo and 2 <= int(k_fijo) <= max(k_lim, 2):
+        ks = [int(k_fijo)]
+    else:
+        ks = list(range(2, k_lim + 1))
+
+    # ----- Paso 3: arranques por Dar Zarrouk y elección de la fuente -----
+    evaluacion = []
+    if modo == "profundidad":
+        k_p = int(k_fijo) if k_fijo else min(5, k_lim)
+        ks = [k_p]
+        h0, r0 = modelo_por_profundidad(k_p, z_e, rhoa)
+        r = ajustar_bloques_lm(geom, rhoa, error_rel, h0, r0, lim_h, lim_r, max_nfev=8, restriccion=restriccion)
+        evaluacion.append({"fuente": "profundidad", "k": k_p, "variante": "log-uniforme en z_e",
+                           "chi2": r["chi2"], clave_ic: criterio_de(r["chi2"], k_p)})
+        fuente = "profundidad"
+        proceso.append(
+            f"3. Modelo de bloques por profundidad: {k_p} capas con interfaces log-uniformes entre z_e mín "
+            f"({np.min(z_e):.2f} m) y z_e máx ({np.max(z_e):.1f} m); ρ inicial = media geométrica de las ρa de "
+            f"cada intervalo. Interfaces iniciales: {', '.join(f'{v:.2f}' for v in np.cumsum(h0))} m."
+        )
+    else:
+        for nombre, (h_f, r_f) in fuentes.items():
+            for k in ks:
+                if len(r_f) <= k:
+                    continue
+                else:
+                    pass
+                for conservar in (False, True):
+                    h0, r0, _ = reducir_dar_zarrouk(h_f, r_f, k, conservar_espesor=conservar)
+                    try:
+                        r = ajustar_bloques_lm(geom, rhoa, error_rel, h0, r0, lim_h, lim_r, max_nfev=8,
+                                               restriccion=restriccion)
+                    except Exception:
+                        continue
+                    evaluacion.append({"fuente": nombre, "k": k,
+                                       "variante": "espesor conservado" if conservar else "clásica",
+                                       "chi2": r["chi2"], clave_ic: criterio_de(r["chi2"], k)})
+        tabla_eval = pd.DataFrame(evaluacion)
+        mejores = tabla_eval.groupby("fuente")[clave_ic].min().sort_values()
+        fuente = str(mejores.index[0])
+        proceso.append(
+            "3. Modelo de bloques por Dar Zarrouk: se redujeron "
+            + " y ".join(fuentes) + f" a {ks[0]}–{ks[-1]} capas (variantes clásica y con espesor conservado) y "
+            "se ajustó brevemente cada reducción. Mejor "
+            + ", ".join(f"{f}: {clave_ic} {v:.1f}" for f, v in mejores.items())
+            + f" → se usa {fuente}."
+        )
+    otra = [f for f in fuentes if f != fuente]
+
+    # ----- Paso 4: Optuna sobre los hiperparámetros de la inversión -----
+    arranques_base: dict[tuple[int, str], tuple[np.ndarray, np.ndarray]] = {}
+    for k in ks:
+        if modo == "profundidad":
+            arranques_base[(k, "profundidad")] = modelo_por_profundidad(k, z_e, rhoa)
+        else:
+            h_f, r_f = fuentes[fuente]
+            if len(r_f) > k:
+                arranques_base[(k, "dz_clasica")] = reducir_dar_zarrouk(h_f, r_f, k, False)[:2]
+                arranques_base[(k, "dz_espesor")] = reducir_dar_zarrouk(h_f, r_f, k, True)[:2]
+            else:
+                pass
+            for o in otra:
+                h_o, r_o = fuentes[o]
+                if len(r_o) > k:
+                    arranques_base[(k, "otra_fuente")] = reducir_dar_zarrouk(h_o, r_o, k, False)[:2]
+                else:
+                    pass
+        for j, (h0, r0) in enumerate(arranques_globales(k, espesores_mc, rho_mc, z_busqueda, n_exploratorios,
+                                                         semilla=k)):
+            arranques_base[(k, f"exploratorio_{j}")] = (h0, r0)
+    # Divisiones del mejor modelo de k−1 capas (se construyen al evaluar,
+    # cuando ya existe el de k−1): introducen una capa nueva donde el modelo
+    # anterior tiene más espacio, con contraste de ambos signos.
+    n_division = 8
+    divisiones = [f"division_{j}" for j in range(n_division)] if modo != "profundidad" else []
+    variantes = sorted({v for _, v in arranques_base} | set(divisiones))
+
+    cache: dict[tuple, dict[str, Any]] = {}
+
+    def base_de(k: int, variante: str):
+        if variante.startswith("division_"):
+            previos = [r for r in cache.values() if r.get("k") == k - 1 and np.isfinite(r.get("chi2", np.inf))]
+            if not previos:
+                return None
+            else:
+                pass
+            mejor_prev = min(previos, key=lambda r: r["chi2"])
+            opciones = _arranques_por_division(mejor_prev, z_fondo)
+            j = int(variante.split("_")[1])
+            return opciones[j] if j < len(opciones) else None
+        else:
+            return arranques_base.get((k, variante))
+
+    def evaluar(k: int, variante: str, escala: float, gamma: float) -> dict[str, Any]:
+        clave = (k, variante, round(escala, 4), round(gamma, 4))
+        if clave in cache:
+            return cache[clave]
+        else:
+            pass
+        if verificar_cancelacion is not None:
+            verificar_cancelacion()
+        else:
+            pass
+        base = base_de(k, variante)
+        if base is None:
+            res = {"chi2": np.inf, "k": k}
+        else:
+            h0 = np.asarray(base[0], float) * escala
+            r0 = np.asarray(base[1], float)
+            lr = np.log(r0)
+            r0 = np.exp(lr.mean() + gamma * (lr - lr.mean()))
+            if restriccion is not None:
+                h0 = restriccion.proyectar(h0)
+            else:
+                pass
+            try:
+                res = ajustar_bloques_lm(geom, rhoa, error_rel, h0, r0, lim_h, lim_r, max_nfev=50,
+                                         restriccion=restriccion)
+            except Exception:
+                res = {"chi2": np.inf}
+            res["k"] = k
+        res.update({"arranque": variante, "escala": escala, "gamma": gamma})
+        res[clave_ic] = criterio_de(res["chi2"], k) if np.isfinite(res["chi2"]) else np.inf
+        cache[clave] = res
+        return res
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    estudio = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=semilla))
+    # Cobertura mínima: todos los arranques base de cada k se evalúan tal
+    # cual (escala 1, γ 1); después Optuna afina con n_trials pruebas más.
+    for k in ks:
+        for v in sorted(v for (kk, v) in arranques_base if kk == k):
+            estudio.enqueue_trial({"k": k, "variante": v, "escala": 1.0, "gamma": 1.0})
+        if k > ks[0]:
+            for v in divisiones:
+                estudio.enqueue_trial({"k": k, "variante": v, "escala": 1.0, "gamma": 1.0})
+        else:
+            pass
+
+    def objetivo(trial):
+        k = trial.suggest_int("k", ks[0], ks[-1])
+        variante = trial.suggest_categorical("variante", variantes)
+        escala = trial.suggest_float("escala", 0.6, 1.6, log=True)
+        gamma = trial.suggest_float("gamma", 0.5, 1.5)
+        return float(evaluar(k, variante, escala, gamma)[clave_ic])
+
+    total = len(estudio.get_trials()) + max(int(n_trials), 5)
+    estudio.optimize(objetivo, n_trials=total)
+    ajustes = [r for r in cache.values() if np.isfinite(r.get("chi2", np.inf))]
+    if not ajustes:
+        raise InversionSEVError("Ninguna inversión por bloques convergió.")
+    else:
+        pass
+    # Refinamiento: las 5 mejores pruebas de cada k se llevan a convergencia
+    # completa (cada prueba de Optuna se limita a 50 evaluaciones).
+    refinados = []
+    for k in sorted({r["k"] for r in ajustes}):
+        for r in sorted((a for a in ajustes if a["k"] == k), key=lambda a: a["chi2"])[:5]:
+            try:
+                f = ajustar_bloques_lm(geom, rhoa, error_rel, r["espesores"], r["rho"], lim_h, lim_r,
+                                       max_nfev=200, restriccion=restriccion)
+            except Exception:
+                continue
+            if np.isfinite(f["chi2"]) and f["chi2"] <= r["chi2"]:
+                f.update({"k": k, "arranque": r["arranque"] + " (refinado)", "escala": r["escala"],
+                          "gamma": r["gamma"]})
+                f[clave_ic] = criterio_de(f["chi2"], k)
+                refinados.append(f)
+            else:
+                pass
+    ajustes = ajustes + refinados
+
+    # Mejor por k, k por criterio con parsimonia (ΔIC < 2 → el más simple).
+    try:
+        J_mc = fw.jacobiano_log(geom, espesores_mc, rho_mc, incluir_espesores=False) / error_rel[:, None]
+        sens_mc = np.sqrt(np.sum(J_mc ** 2, axis=0))
+    except Exception:
+        sens_mc = None
+    candidatos = []
+    filas = []
+    for k in sorted({r["k"] for r in ajustes}):
+        de_k = [r for r in ajustes if r["k"] == k]
+        mejor_k = _elegir_equivalente(de_k, N, espesores_mc, rho_mc, z_busqueda[1], sensibilidad=sens_mc)
+        mejor_k = dict(mejor_k)
+        mejor_k["k"] = k
+        mejor_k["BIC"] = criterio_de(mejor_k["chi2"], k) if clave_ic == "BIC" else mejor_k.get("BIC", np.nan)
+        p = 2 * k - 1
+        mejor_k["BIC"] = mejor_k["chi2"] * N + p * np.log(N)
+        mejor_k["AIC"] = mejor_k["chi2"] * N + 2 * p + 2 * p * (p + 1) / max(N - p - 1, 1)
+        candidatos.append(mejor_k)
+        filas.append({"k": k, "parametros": p, "chi2": mejor_k["chi2"], "rms": mejor_k["rms"],
+                      "BIC": mejor_k["BIC"], "AIC": mejor_k["AIC"],
+                      "arranque": f"{mejor_k['arranque']} (escala {mejor_k['escala']:.2f}, γ {mejor_k['gamma']:.2f})",
+                      "pruebas": len(de_k),
+                      "interfaces_m": ", ".join(f"{v:.3g}" for v in np.cumsum(mejor_k["espesores"])),
+                      "resistividades": ", ".join(f"{v:.3g}" for v in mejor_k["rho"])})
+    minimo = min(c[clave_ic] for c in candidatos)
+    elegido = min((c for c in candidatos if c[clave_ic] <= minimo + 2.0), key=lambda c: c["k"])
+    # Pulido con pyGIMLi (solo si cumple el espesor mínimo y mejora Δφ > 1).
+    try:
+        pulido = invertir_bloques(geom, rhoa, error_rel, elegido["espesores"], elegido["rho"], lam=1.0,
+                                  limites_espesor=lim_h, limites_rho=lim_r)
+        factible = restriccion is None or restriccion.cumple(pulido["espesores"])
+        if factible and (elegido["chi2"] - pulido["chi2"]) * N > 1.0:
+            for c in ("espesores", "rho", "respuesta", "chi2", "rms"):
+                elegido[c] = pulido[c]
+            elegido["arranque"] = f"{elegido['arranque']} + pulido pyGIMLi"
+        else:
+            pass
+    except Exception as exc:
+        logger.debug("Pulido falló: %s", exc)
+    if not k_fijo:
+        elegido = _fusionar_similares(geom, rhoa, error_rel, elegido, clave_ic, lim_h, lim_r, candidatos,
+                                      restriccion=restriccion)
+    else:
+        pass
+    tabla = pd.DataFrame(filas)
+    tabla["seleccionado"] = tabla["k"] == elegido["k"]
+    pruebas = pd.DataFrame([{"k": r["k"], "arranque": r["arranque"], "escala": r["escala"], "gamma": r["gamma"],
+                             "chi2": r["chi2"], clave_ic: r[clave_ic]} for r in cache.values()])
+    restr = (f"espesor mínimo: 1.ª capa ≥ {restriccion.h_min_1:.2f} m y cada capa ≥ "
+             f"{100 * restriccion.fraccion:.0f} % de la profundidad de su techo" if restriccion else "sin espesor mínimo")
+    proceso.append(
+        f"4. Inversión de bloques optimizada con Optuna ({len(estudio.trials)} pruebas: arranques base de cada k "
+        f"(Dar Zarrouk, otra fuente, división del modelo de k−1 capas, {n_exploratorios} exploratorios) + "
+        f"{max(int(n_trials), 5)} de búsqueda): hiperparámetros k "
+        f"({ks[0]}–{ks[-1]}), variante del arranque, escala de profundidades (0.6–1.6) y contraste γ (0.5–1.5); "
+        f"cada prueba por Levenberg–Marquardt con {restr}; criterio {clave_ic}. Elegido: {elegido['k']} capas, "
+        f"χ² = {elegido['chi2']:.2f}, arranque {elegido['arranque']}."
+    )
+    return elegido, tabla, pruebas, proceso
 
 
 def seleccionar_simplificado(
@@ -1287,9 +1610,10 @@ class ConfigInversion:
     Attributes
     ----------
     metodo_lambda : {'optuna', 'discrepancia', 'manual'}
-    regularizacion : {'nitida', 'suave'}
-        Nítida (soporte de gradiente mínimo, por defecto): multicapa por
-        bloques con interfaces definidas. Suave: Occam clásico (L2).
+    regularizacion : {'suave', 'robusta', 'nitida'}
+        Suave (por omisión): Occam clásico, L2. Robusta: Occam con los datos
+        en norma L1 (reponderación iterativa de pyGIMLi), menos sensible a
+        lecturas aberrantes. Nítida: soporte de gradiente mínimo (bloques).
     lam : float
         λ del modo manual.
     n_trials : int
@@ -1298,15 +1622,25 @@ class ConfigInversion:
         Reponderación robusta de datos (IRLS) en la inversión suave.
     k_max : int
         Máximo de capas del modelo simplificado.
+    modo_bloques : {'dar_zarrouk', 'profundidad'}
+        Origen del modelo de bloques inicial: reducción de Dar Zarrouk de
+        Zohdy y del multicapa (se usa la que mejor ajusta) o división
+        log-uniforme de la profundidad de Edwards en ``k_profundidad``
+        capas.
+    k_profundidad : int
+        Capas del modo por profundidad.
+    n_trials_bloques : int
+        Pruebas de Optuna en la inversión de bloques.
     espesor_min_fraccion : float
         Espesor mínimo de cada capa del simplificado como fracción de la
         profundidad de su techo (la primera capa: al menos la profundidad
         de investigación de la apertura más corta). 0 = sin restricción.
-    zohdy : {'ab_n', 'factor_edwards'}
-        Profundidad de atribución de Zohdy: z = AB/n con n buscado entre
-        ``zohdy_n_min`` y ``zohdy_n_max`` (paso ``zohdy_paso``), evaluando
-        cada n con las resistividades ya corregidas; o el factor sobre la
-        profundidad de Edwards elegido antes de corregir (versión previa).
+    zohdy : {'edwards', 'rango', 'factor_edwards'}
+        Profundidad de atribución de Zohdy, z = AB/n. ``'edwards'``: n en
+        n_E ± ``zohdy_ventana`` (n_E = AB/z_e de Edwards); ``'rango'``: n
+        entre ``zohdy_n_min`` y ``zohdy_n_max``. En ambos el paso es
+        ``zohdy_paso`` y cada n se evalúa con Zohdy completo (resistividades
+        corregidas). ``'factor_edwards'``: versión previa.
     malla : {'zohdy', 'logaritmica'}
         Malla del multicapa. ``'zohdy'``: interfaces de Zohdy subdivididas
         hasta la profundidad viable f·max(z_e). ``'logaritmica'``: malla
@@ -1325,7 +1659,7 @@ class ConfigInversion:
     """
 
     metodo_lambda: str = "optuna"
-    regularizacion: str = "nitida"
+    regularizacion: str = "suave"
     lam: float = 20.0
     n_trials: int = 10
     robusto: bool = False
@@ -1333,8 +1667,12 @@ class ConfigInversion:
     n_arranques: int = 24
     k_fijo: int = 0
     malla: str = "zohdy"
+    modo_bloques: str = "dar_zarrouk"
+    k_profundidad: int = 5
+    n_trials_bloques: int = 40
     espesor_min_fraccion: float = 0.25
-    zohdy: str = "ab_n"
+    zohdy: str = "edwards"
+    zohdy_ventana: float = 1.0
     zohdy_n_min: float = 5.0
     zohdy_n_max: float = 8.0
     zohdy_paso: float = 0.125
@@ -1359,6 +1697,8 @@ class ResultadoInversion:
     metricas: dict[str, Any] = field(default_factory=dict)
     advertencias: list[str] = field(default_factory=list)
     zohdy: Optional[pd.DataFrame] = None
+    pruebas_bloques: Optional[pd.DataFrame] = None
+    proceso: Optional[pd.DataFrame] = None
 
 
 def invertir_sondeo(
@@ -1371,6 +1711,7 @@ def invertir_sondeo(
     cfg = config or ConfigInversion()
     fw.fijar_motor(cfg.motor)
     advertencias: list[str] = []
+    proceso: list[str] = []
     inicio = time.time()
 
     datos = procesado[procesado["usar"]].reset_index(drop=True)
@@ -1388,20 +1729,38 @@ def invertir_sondeo(
     geom_z = fw.GeometriaSondeo.desde_tabla(curva)
     ze_curva = curva["z_mediana"].to_numpy(float)
     longitud_ab = longitud_ab_equivalente(curva)
-    if cfg.zohdy == "ab_n" and np.all(np.diff(longitud_ab) > 0):
+    modo_zohdy = {"ab_n": "rango"}.get(cfg.zohdy, cfg.zohdy)
+    if modo_zohdy in ("edwards", "rango") and np.all(np.diff(longitud_ab) > 0):
+        # n de Edwards: la profundidad mediana de investigación expresada como
+        # AB/n (≈ 5.3 en Schlumberger, ≈ 5.8 en Wenner).
+        n_edwards = float(np.median(longitud_ab / ze_curva))
+        if modo_zohdy == "edwards":
+            n_min = max(n_edwards - cfg.zohdy_ventana, 1.0)
+            n_max = n_edwards + cfg.zohdy_ventana
+        else:
+            n_min, n_max = cfg.zohdy_n_min, cfg.zohdy_n_max
         zoh = zh.invertir_zohdy_ab(geom_z, curva["rhoa_proc"].to_numpy(float), longitud_ab,
-                                   n_min=cfg.zohdy_n_min, n_max=cfg.zohdy_n_max, paso=cfg.zohdy_paso)
+                                   n_min=n_min, n_max=n_max, paso=cfg.zohdy_paso)
         # Factor equivalente sobre la profundidad de Edwards (para la malla).
         zoh.factor_profundidad = float(np.median(longitud_ab / zoh.n_ab / ze_curva))
-        if min(abs(zoh.n_ab - cfg.zohdy_n_min), abs(zoh.n_ab - cfg.zohdy_n_max)) < 1e-9:
+        proceso.append(
+            f"1. Zohdy: profundidad de cada capa z = AB/n; n de Edwards = {n_edwards:.2f}; búsqueda de n en "
+            f"{n_min:.3g}–{n_max:.3g} con paso {cfg.zohdy_paso:g} "
+            f"({'Edwards ± ' + format(cfg.zohdy_ventana, 'g') if modo_zohdy == 'edwards' else 'rango fijo'}); "
+            f"cada n se evalúa con las resistividades ya corregidas. Mejor: AB/{zoh.n_ab:g}, RMS {zoh.rms:.2f} %, "
+            f"{len(zoh.resistividades)} capas."
+        )
+        if min(abs(zoh.n_ab - n_min), abs(zoh.n_ab - n_max)) < 1e-9:
             advertencias.append(
-                f"Zohdy: la mejor profundidad quedó en el límite del rango (AB/{zoh.n_ab:g}); el óptimo puede "
-                f"estar fuera de AB/{cfg.zohdy_n_min:g}–AB/{cfg.zohdy_n_max:g}. Considere ampliar el rango."
+                f"Zohdy: la mejor profundidad quedó en el límite de la búsqueda (AB/{zoh.n_ab:g}); el óptimo puede "
+                f"estar fuera de AB/{n_min:.3g}–AB/{n_max:.3g}. Considere ampliar el rango."
             )
         else:
             pass
     else:
         zoh = zh.invertir_zohdy(geom_z, curva["rhoa_proc"].to_numpy(float), ze_curva)
+        proceso.append(f"1. Zohdy (factor sobre Edwards, versión previa): factor {zoh.factor_profundidad:.2f}, "
+                       f"RMS {zoh.rms:.2f} %.")
     # Malla del multicapa: capas finas equiespaciadas en log z, desde la
     # mitad de la menor profundidad de investigación hasta 2.5 veces la
     # mayor (espacio para que la DOI muestre dónde dejan de ver los datos).
@@ -1419,13 +1778,27 @@ def invertir_sondeo(
     rho_inicial = fw.muestrear_modelo(zoh.espesores, zoh.resistividades, centros)
 
     # --- 2. Occam con pyGIMLi desde Zohdy ---
+    robusto = bool(cfg.robusto or cfg.regularizacion == "robusta")
     mejor, lambdas = buscar_lambda(
         geom, rhoa, error, espesores, rho_inicial,
         metodo=cfg.metodo_lambda, n_trials=cfg.n_trials, lam_manual=cfg.lam,
-        robusto=cfg.robusto, verificar_cancelacion=verificar_cancelacion,
+        robusto=robusto, verificar_cancelacion=verificar_cancelacion,
         nitida=cfg.regularizacion == "nitida",
     )
     rho_mc = mejor["rho"]
+    nombre_reg = {"suave": "suave (Occam, L2)", "robusta": "robusta (datos en norma L1 por IRLS)",
+                  "nitida": "nítida (gradiente mínimo)"}.get(cfg.regularizacion, cfg.regularizacion)
+    nombre_lam = {"optuna": f"Optuna ({cfg.n_trials} pruebas; λ entre 0.1 y 1000)",
+                  "discrepancia": "discrepancia (mayor λ con χ² ≤ 1)", "manual": "manual"}.get(cfg.metodo_lambda, "")
+    if cfg.regularizacion == "nitida" and cfg.metodo_lambda != "manual":
+        nombre_lam = "continuación de 100 a 0.3"
+    else:
+        pass
+    proceso.append(
+        f"2. Multicapa con pyGIMLi: {len(rho_mc)} capas de espesor fijo hasta {z_viable:.1f} m "
+        f"(malla {'sobre las interfaces de Zohdy' if cfg.malla == 'zohdy' else 'logarítmica'}), modelo inicial = "
+        f"Zohdy; regularización {nombre_reg}; λ por {nombre_lam} → λ = {mejor['lam']:.3g}, χ² = {mejor['chi2']:.2f}."
+    )
     if mejor["chi2"] > 3.0:
         advertencias.append(
             f"El modelo multicapa no alcanza el nivel de ruido (χ² = {mejor['chi2']:.1f}): "
@@ -1452,17 +1825,20 @@ def invertir_sondeo(
     else:
         pass
 
-    # --- 4. Simplificado: Dar Zarrouk + bloques + BIC ---
-    simp, seleccion = seleccionar_simplificado(
-        geom, rhoa, error, espesores, rho_mc, k_max=cfg.k_max, criterio=cfg.criterio,
-        verificar_cancelacion=verificar_cancelacion, z_max_datos=float(np.max(datos["z_mediana"])),
-        n_arranques=cfg.n_arranques, z_min_datos=float(np.min(datos["z_mediana"])),
-        k_fijo=int(cfg.k_fijo), modelo_zohdy=(zoh.espesores, zoh.resistividades),
-        z_viable=z_viable if cfg.malla == "zohdy" else None,
-        restriccion=(RestriccionEspesor(h_min_1=float(np.min(datos["z_mediana"])),
-                                        fraccion=float(cfg.espesor_min_fraccion))
-                     if cfg.espesor_min_fraccion > 0 else None),
+    # --- 4. Bloques: Dar Zarrouk (o profundidad) + inversión optimizada con Optuna ---
+    restriccion = (RestriccionEspesor(h_min_1=float(np.min(datos["z_mediana"])),
+                                      fraccion=float(cfg.espesor_min_fraccion))
+                   if cfg.espesor_min_fraccion > 0 else None)
+    simp, seleccion, pruebas_bloques, pasos = invertir_bloques_optuna(
+        geom, rhoa, error, {"Zohdy": (zoh.espesores, zoh.resistividades), "multicapa": (espesores, rho_mc)},
+        espesores, rho_mc, k_max=cfg.k_max, k_fijo=int(cfg.k_fijo if cfg.modo_bloques != "profundidad"
+                                                         else cfg.k_profundidad),
+        criterio=cfg.criterio, n_trials=cfg.n_trials_bloques, restriccion=restriccion,
+        z_max_datos=float(np.max(datos["z_mediana"])), z_min_datos=float(np.min(datos["z_mediana"])),
+        z_viable=z_viable if cfg.malla == "zohdy" else None, modo=cfg.modo_bloques,
+        z_e=datos["z_mediana"].to_numpy(float), verificar_cancelacion=verificar_cancelacion,
     )
+    proceso.extend(pasos)
     cov = covarianza_bloques(geom, simp["espesores"], simp["rho"], error)
 
     # --- 5. IP ---
@@ -1579,5 +1955,6 @@ def invertir_sondeo(
     return ResultadoInversion(
         multicapa=multicapa, simplificado=simplificado, ajuste=ajuste,
         seleccion=seleccion, lambdas=lambdas, metricas=metricas, advertencias=advertencias,
-        zohdy=zohdy_tabla,
+        zohdy=zohdy_tabla, pruebas_bloques=pruebas_bloques,
+        proceso=pd.DataFrame({"paso": [p.split(".")[0] for p in proceso], "descripcion": proceso}),
     )

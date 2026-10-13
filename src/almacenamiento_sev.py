@@ -79,7 +79,7 @@ TABLAS_POR_ETAPA: dict[str, tuple[str, ...]] = {
     "crudo": ("lectura", "empalmes", "modelo_referencia"),
     "promedio": ("promedio",),
     "procesado": ("procesado",),
-    "inversion": ("multicapa", "simplificado", "ajuste", "seleccion", "lambdas", "zohdy"),
+    "inversion": ("multicapa", "simplificado", "ajuste", "seleccion", "lambdas", "zohdy", "pruebas_bloques", "proceso"),
     "parametros": ("parametros", "unidades", "resumen_unidades"),
     "perfiles": ("perfil_sondeos", "perfil_lci", "perfil_ajuste", "perfil_ruta"),
 }

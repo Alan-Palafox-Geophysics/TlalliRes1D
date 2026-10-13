@@ -114,6 +114,13 @@ def fijar_proyecto(proyecto: Proyecto) -> None:
     st.session_state[CLAVE_SONDEO] = None
     limpiar_cache_datos()
     registrar_log(f"Proyecto activo: {proyecto.nombre}")
+    # Parámetros de la campaña guardados en el proyecto: se usan por omisión.
+    guardados = pl.cargar_parametros(proyecto)
+    if guardados is not None:
+        st.session_state[CLAVE_CONFIG] = guardados
+        registrar_log("Parámetros de la campaña cargados del proyecto.")
+    else:
+        pass
 
 
 def obtener_proyecto() -> Optional[Proyecto]:

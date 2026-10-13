@@ -94,6 +94,12 @@ with st.container(border=True):
         pass
     config.preproceso = pp
     estado.fijar_config(config)
+    st.caption(
+        "Criterio: las direcciones se promedian **geométricamente**. Con 2 direcciones no se descarta "
+        "ninguna (no se puede saber cuál es la buena): su discrepancia solo aumenta el error del dato. "
+        "Con 3 o más, se descarta la que contradice a la mayoría. Un dato se trata como anómalo solo si "
+        "se sale de la tendencia de **su sondeo** y también de la dispersión típica de **la campaña** "
+        "(mediana de los demás sondeos preprocesados).")
 
     b = st.columns([1, 1, 2])
     if b[0].button("🧹 Preprocesar este sondeo", type="primary", key="btn_prep"):

@@ -6,8 +6,9 @@ DuckDB, lógica fuera de la interfaz y pruebas sin navegador):
 
 ```
 lectura y QA/QC → empalmes → promedio de direcciones → preprocesamiento
-→ Zohdy → multicapa (pyGIMLi, λ por Optuna) → DOI
-→ reducción de Dar Zarrouk + BIC → simplificado (pyGIMLi) → IP (Seigel)
+→ 1. Zohdy (búsqueda de AB/n) → 2. multicapa (pyGIMLi, Occam/L1, λ por Optuna) → DOI
+→ 3. Dar Zarrouk de Zohdy y del multicapa (gana el que mejor ajusta)
+→ 4. modelo de bloques (Optuna + LM con espesor mínimo, BIC) → IP (Seigel)
 → S, T, ρL, ρT, λ, ρm, corrosividad → unidades geoeléctricas (GMM)
 → perfiles 2D: pseudosecciones, secciones interpoladas e inversión LCI (pyGIMLi)
 ```
@@ -33,6 +34,10 @@ Texto con columnas `Sondeo, ID, a, AB/2, MN/2, K, I, V, R, ResApp, Direccion, IP
   solos; los nombres de columna admiten sinónimos y acentos.
 - `IP` es opcional (cero si falta); `Direccion` también (una sola dirección `U`).
 - Un archivo puede traer varios sondeos y varias direcciones por sondeo.
+- **Mínimo:** solo `AB_2, MN_2, AppRes` (o `AB/2, MN/2, ResApp`). En ese caso no se
+  recalcula nada (sin K, I, V ni R no hay qué recalcular): se usa la ρa del archivo tal
+  cual, sin corrección de empalmes, y solo se aplica el suavizado opcional y la inversión.
+  Se asume Schlumberger salvo que se fuerce otro arreglo.
 - Coordenadas aparte: `Sondeo, X, Y, Z` (o se escriben en la tabla de la pantalla 1).
 - Modelo de referencia opcional por sondeo (pozo o sintético): `espesor, rho[, m_ip]`.
 
@@ -82,8 +87,12 @@ en dipolo-dipolo y polo-dipolo sí. Aquí se llama al núcleo con el orden corre
 **Promedio de direcciones.** Media geométrica (log ρa) sobre la geometría de la dirección
 con más datos; las demás se interpolan en log-log sin extrapolar. El ruido por dirección
 se estima **agrupado** (mediana de varianzas corregida por el sesgo de χ²ν) y el error de
-cada punto es σ/√n. Con dos direcciones, la desviación punto a punto es demasiado
-inestable para usarla como peso.
+cada punto es el mayor entre σ_agrupada/√n y la dispersión de ese punto /√n.
+- **Con 2 direcciones** no se puede saber cuál es la buena: siempre se usa la media
+  geométrica y nunca se descarta una dirección. Si discrepan, solo aumenta el error del
+  dato (pesa menos en la inversión).
+- **Con 3 o más direcciones** hay mayoría: si una discrepa de la referencia y las demás
+  no, se descarta la discrepante y se rehace el promedio con las coherentes.
 
 **Empalmes de MN.** Se mide el salto sobre los residuales de un ajuste físico con la
 geometría exacta de cada lectura. Así no se borra la parte física del salto (MN no
@@ -92,77 +101,82 @@ traslapes son coherentes entre sí.
 
 **Detección de anómalos.** Se usa como referencia la curva de una inversión suave robusta
 (IRLS ≈ L1): mide lo que ningún medio 1D explica. Un dato es anómalo si cumple:
-- z robusto > 3 y error > 10 %, o
-- dispersión entre direcciones > 20 % y > 2.5σ, o
+- se sale de la tendencia **de su propio sondeo** (z robusto > 3 frente a la escala de
+  residuales del sondeo) **y** de la **de la campaña** (z > 3 frente a la escala mediana
+  de los demás sondeos) y su error es > 10 %; o
+- dispersión entre direcciones > 20 % y > 2.5σ, solo con 3 o más direcciones; o
 - pendiente ascendente > 45° (SCH/WE).
 
-Si una dirección discrepa y otra no, se descarta la discrepante y se rehace el promedio.
+La escala de la campaña se obtiene en dos pasadas: al procesar un archivo, primero se
+promedian y preprocesan todos los sondeos; después se repite el preprocesamiento de cada
+uno con la escala mediana de los demás y se continúa con la inversión. Al reprocesar un
+sondeo suelto se usa la escala guardada de los demás. Así no se descartan datos de un
+sondeo ruidoso por compararlo solo consigo mismo, ni saltos que son normales en la campaña.
+
 Tratamientos disponibles: suavizar (por defecto), ponderar o eliminar.
 
-**Zohdy.** A cada dato se le asigna la base de su capa en z = AB/n. Se prueban n de 5 a 8
-en pasos de 0.125 (configurable) y cada n se evalúa con Zohdy completo, es decir, con
-las resistividades ya corregidas. Gana el n de menor RMS.
-- La regla empírica AB/6 coincide con la profundidad de Edwards (AB/5.3 en Schlumberger,
-  AB/5.8 en Wenner).
-- En los sintéticos el óptimo cae entre AB/5.75 y AB/7.1 en el modelo A. En el modelo B
-  cae en AB/4.25–4.75, fuera del rango; la app avisa cuando el óptimo queda en el borde.
-- En arreglos sin AB definido se usa una longitud equivalente de 5.3·z_e.
-- La versión anterior (factor sobre Edwards, elegido antes de corregir ρ) sigue disponible.
+### Proceso de inversión (pantalla 3)
 
-**Multicapa.** Profundidades fijas; solo se invierte ρ.
+La inversión de cada sondeo sigue cuatro pasos. Cada paso puede ir en **automático** o
+con **parámetros fijos**, y la configuración completa se guarda para toda la campaña
+(ver "Parámetros de campaña"). La pantalla muestra, para cada sondeo, el texto de lo que
+se hizo realmente en cada paso (n de Zohdy elegido, λ, fuente de Dar Zarrouk, pruebas de
+Optuna, k elegido).
 
-La malla por defecto se construye sobre Zohdy. El factor de profundidad f que mejor
-ajusta la curva calibra la escala de profundidades con los datos.
-- La **profundidad máxima viable** es f·máx(z_e). En los sintéticos da 164–228 m, contra
-  433–478 m de la malla logarítmica anterior (2.5·máx z_e).
-- Las celdas son las interfaces de Zohdy subdivididas en log z (~50 celdas), así que el
-  modelo de Zohdy entra exacto como modelo inicial.
-- La DOI y la búsqueda de interfaces del simplificado se limitan a la profundidad viable.
-- La malla logarítmica sigue disponible como opción.
+**Paso 1 — Zohdy (modelo inicial multicapa).** A cada dato se le asigna la base de su
+capa en z = AB/n y su resistividad se corrige iterativamente hasta que la curva calculada
+reproduce la observada. Se prueban varios n y cada uno se evalúa con Zohdy completo
+(con las resistividades ya corregidas); gana el n de menor RMS.
+- **Modo Edwards (por omisión):** n = n_Edwards ± 1 en pasos de 0.125. n_Edwards es la
+  mediana de AB/z_e (≈ 5.3 en Schlumberger, ≈ 5.8 en Wenner). La ventana (±1) y el paso
+  son configurables.
+- **Modo rango:** n entre un mínimo y un máximo (p. ej. 5–7) con el paso elegido.
+- **Modo factor (anterior):** factor sobre la profundidad de Edwards, elegido antes de
+  corregir ρ.
+- La app avisa si el óptimo queda en el borde del rango. En arreglos sin AB definido se
+  usa una longitud equivalente de 5.3·z_e.
 
-El multicapa se invierte desde ese modelo inicial. pyGIMLi resuelve con regularización nítida (soporte de gradiente
-mínimo) o suave (Occam L2).
-- Nítida: la reponderación se itera **hasta converger** (hasta 15 vueltas).
-- λ se recorre por continuación de 100 a 0.3, y cada λ parte del modelo del anterior.
-- λ se limita a 100. Por encima, en la parte profunda (poco sensible) manda la
-  regularización, los contrastes se suavizan y se desplazan hacia abajo.
-- Suave: λ se elige con Optuna, minimizando |ln χ²| + 0.1·rugosidad + una penalización
-  por residuales correlacionados.
+**Paso 2 — Multicapa con pyGIMLi.** Profundidades fijas; solo se invierte ρ, partiendo
+del modelo de Zohdy.
+- **Malla:** las interfaces de Zohdy subdivididas en log z (~50 celdas) hasta la
+  **profundidad máxima viable** f·máx(z_e), donde f es el factor de profundidad que mejor
+  ajusta. La malla logarítmica sigue disponible.
+- **Regularización:** Occam suave (L2) por omisión; **robusta** (L1 en los datos, IRLS de
+  pyGIMLi, resiste datos malos) seleccionable; nítida (gradiente mínimo) como opción.
+- **λ por Optuna:** se minimiza |ln χ²| + 0.1·rugosidad + una penalización por
+  residuales correlacionados (λ entre 0.1 y 1000). También puede fijarse a mano.
 
-Zohdy sirve solo de modelo inicial: con un arranque homogéneo, el multicapa converge al
-mismo resultado.
+**Paso 3 — Dar Zarrouk: elegir la fuente del modelo de bloques.** Tanto Zohdy como el
+multicapa se reducen a 2…k_max capas por Dar Zarrouk (segmentación óptima por programación
+dinámica; variante clásica h = √(TS), ρ = √(T/S), y variante con espesor conservado).
+Cada reducción se ajusta rápidamente y se comparan por BIC: la fuente que mejor ajusta
+(Zohdy o multicapa) da los arranques principales; la otra queda como arranque
+alternativo.
 
-Invertir las capas de Zohdy (una por dato) con espesores y ρ libres no es viable: hay
-2N−1 incógnitas para N datos.
-- Sin regularización, el modelo acumula capas de menos de 0.5 m y resistividades
-  extremas. Con 3 % de ruido ajusta el ruido: salen valores de 3 a 43 000 Ω·m.
-- Con Marquardt amortiguado detenido en χ² ≤ 1, no se aleja de Zohdy.
+**Paso 4 — Inversión de bloques con Optuna.** Optuna (TPE) explora los hiperparámetros
+viables:
+- **k** (número de capas, 2…k_max, o fijo);
+- **variante del arranque:** Dar Zarrouk clásico, Dar Zarrouk con espesor conservado,
+  la otra fuente, división del mejor modelo de k−1 capas, o 10 arranques exploratorios
+  por hipercubo latino (interfaces en log z; ρ = media del multicapa en cada capa);
+- **escala de profundidades** (0.6–1.6, logarítmica) y **contraste γ** (0.5–1.5) aplicados
+  al arranque.
 
-pyGIMLi tampoco ofrece esa opción. Su inversión multicapa (`VESRhoModelling`) fija los
-espesores e invierte solo ρ, igual que aquí. Su inversión por bloques (`VESModelling`)
-libera h y ρ, pero en pocas capas: es el simplificado. La pantalla de inversión muestra el modelo de Zohdy propio (una capa
-por dato) y la curva que genera.
+Primero se encolan todos los arranques base de cada k; luego vienen las pruebas de
+búsqueda (40 por omisión). Cada prueba es un Levenberg–Marquardt acotado (SciPy,
+jacobiano analítico) con **espesor mínimo obligatorio**. Los 5 mejores de cada k se
+refinan hasta converger. k se elige por BIC (o AIC); con ΔIC < 2 gana el más simple.
+Entre ajustes equivalentes (Δφ ≤ 0.25) gana el de **mínima estructura**, Σ(Δ ln ρ)². El
+elegido se pule con la inversión de bloques de pyGIMLi si mejora el ajuste, y se funden
+capas contiguas casi iguales.
 
-**DOI.** Índice de Oldenburg y Li con pesos en profundidad física (suavidad ∝ 1/Δz,
-atracción a la referencia ∝ espesor). Sin esa ponderación, R sale ≈ 0 a cualquier
-profundidad.
+**Modo de bloques por profundidad (alternativo).** No usa Zohdy ni el multicapa para
+arrancar: el intervalo de profundidades de investigación de Edwards [z_e mín, z_e máx]
+se divide en las k capas que indica el usuario, con interfaces **log-uniformes**. La ρ inicial de cada capa es la
+media (geométrica) de las ρa cuyos z_e caen en ese rango. Ese modelo se invierte con el
+mismo Optuna + LM del paso 4 (k fijo).
 
-**Simplificado.** Para k = 2…kmax se prueban cuatro familias de arranques:
-- el modelo de Zohdy reducido a k capas por Dar Zarrouk;
-- reducción de Dar Zarrouk del multicapa (segmentación óptima por programación dinámica;
-  clásica h = √TS, ρ = √(T/S), y con espesor conservado);
-- división del mejor modelo de k−1 capas (incluida la división neutra, que garantiza
-  χ² no creciente);
-- **búsqueda global**: hasta 24 posiciones de interfaces por hipercubo latino (log z, entre
-  la menor y 1.5 veces la mayor profundidad de investigación). En cada capa, ρ inicial es
-  la media del multicapa.
-
-Cada arranque se ajusta con Levenberg–Marquardt acotado (SciPy, jacobiano analítico).
-Se hace en dos etapas: todos los arranques con 8 evaluaciones, y los 6 mejores hasta
-converger. Eso reduce el tiempo a la mitad (30–45 s por sondeo) sin cambiar el
-resultado. El elegido se pule con la inversión de bloques de pyGIMLi.
-
-**Espesor mínimo.** El simplificado no acepta capas que el SEV no puede resolver:
+**Espesor mínimo.** El modelo de bloques no acepta capas que el SEV no puede resolver:
 - la primera capa mide al menos la profundidad de investigación de la apertura más
   corta;
 - cada capa siguiente mide al menos una fracción (25 % por omisión, ajustable) de la
@@ -170,22 +184,30 @@ resultado. El elegido se pule con la inversión de bloques de pyGIMLi.
 
 La restricción va dentro del ajuste, no como filtro posterior. Las interfaces se
 parametrizan como ln z₁ = ln h_min + w₁ y ln zᵢ = ln zᵢ₋₁ + ln(1 + f) + wᵢ, con w ≥ 0,
-y el jacobiano se transforma analíticamente. El pulido con pyGIMLi y la fusión de capas
-solo se aceptan si cumplen la restricción.
+y el jacobiano se transforma analíticamente.
 
-**Equivalencia.** Entre los ajustes que explican los datos igual de bien (Δφ ≤ 0.25),
-se queda el más parecido al multicapa. La comparación se pondera por la sensibilidad de
-los datos a cada profundidad, para que la parte profunda (donde el multicapa lo decide
-la regularización) no pese. Así se evita, por ejemplo, un
-conductor delgado de 3 Ω·m cuando uno de 10 Ω·m y el triple de espesor da la misma
-curva.
+Las incertidumbres ±1σ salen de la covarianza linealizada e indican si la capa resuelve
+h y ρ, solo S, solo T o nada.
 
-Se elige k por BIC; con ΔBIC < 2 gana el más simple. También se puede fijar k a mano
-("Capas fijas") para revisar los candidatos de la tabla de selección. Las incertidumbres
-±1σ salen de la covarianza linealizada e indican si la capa resuelve h y ρ, solo S,
-solo T o nada.
+**Colores en los gráficos.** Zohdy: amarillo, línea delgada. Multicapa: naranja, ancho
+normal. Modelo invertido (bloques): azul (0, 0, 255), línea gruesa.
 
-**Parámetros acumulados (interpretación).** Para el multicapa y el simplificado se
+**Parámetros de campaña.** El botón "Guardar parámetros de la campaña" escribe
+`parametros_campana.json` en la carpeta del proyecto (viaja dentro del `.isev`) y se
+carga al abrir el proyecto. También se puede exportar/importar el JSON para usarlo en
+otra campaña. "Automático" restablece los valores recomendados.
+
+**Corrosividad.** Se estima a partir del modelo invertido (bloques), por capa, con las
+clases de resistividad de NACE/Roberge (Ω·m): < 5 muy alta, 5–10 alta, 10–20 moderada,
+20–100 baja, > 100 muy baja (umbrales editables). Se grafica debajo del último gráfico
+de la inversión: el modelo sobre las bandas de clase, la clase de cada capa y la
+resistividad longitudinal media ρL(0–z) con la profundidad de evaluación.
+
+**DOI.** Índice de Oldenburg y Li con pesos en profundidad física (suavidad ∝ 1/Δz,
+atracción a la referencia ∝ espesor). Sin esa ponderación, R sale ≈ 0 a cualquier
+profundidad.
+
+**Parámetros acumulados (interpretación).** Para el multicapa y el modelo de bloques se
 calculan, por capa y acumulados desde la superficie:
 - S, T, ρL = H/S, ρT = T/H, ρ promedio = √(ρL·ρT) y anisotropía λ;
 - el contraste de cada capa contra el promedio de lo que tiene encima (≥ 2: aumento
@@ -223,20 +245,25 @@ ajustable.
 direcciones, IP) con AB/2 hasta 500 m, sobre el modelo A (por defecto) o el B
 (`--modelo B --carpeta ejemplos/modelo_B`).
 
-### Modelo B (contrastes moderados)
+Métricas de error usadas en toda la validación: **χ²** (con el error de cada dato),
+**MAPE** y **validación cruzada** dejando uno fuera (CV-MAPE: se quita un dato, se
+reajusta el modelo de bloques y se predice el dato quitado).
 
-| Profundidad | ρ real | Schlumberger (S1) | Wenner (S2) |
+### Modelo B (contrastes moderados), sondeo S1 Schlumberger
+
+| Profundidad | ρ real | Curva exacta | 3 % de ruido, 2 direcciones |
 |---|---|---|---|
-| 0–5 m | 50 | 0–5 m · 50 | 0–5 m · 50 |
-| 5–15 m | 100 | 5–15 m · 100 | 5–15 m · 100 |
-| 15–30 m | 20 | 15–30.2 m · 20.1 | 15–30.2 m · 20 |
-| 30–50 m | 60 | 30.2–49.6 m · 61.2 | 30.2–48.9 m · 62.7 |
-| 50–80 m | 10 | 49.6–80.1 m · 10.1 | 48.9–81.2 m · 10.7 |
-| > 80 m | 75 | > 80.1 m · 75 | > 81.2 m · 75 |
+| 0–5 m | 50 | 0–5 m · 50 | 0–4.7 m · 49.6 |
+| 5–15 m | 100 | 5–15 m · 100 | 4.7–15 m · 92.8 |
+| 15–30 m | 20 | 15–30 m · 20 | 15–170 m · 28.6 (agrupa 15–80 m) |
+| 30–50 m | 60 | 30–50 m · 60 | |
+| 50–80 m | 10 | 50–80 m · 10 | |
+| > 80 m | 75 | > 80 m · 75 | > 170 m · 98 |
+| χ² / MAPE / CV-MAPE | | 0.00 / 0.00 % / 0.00 % | 0.55 / 1.55 % / 2.10 % |
 
-Curvas exactas. El BIC elige 6 capas en los dos arreglos. El multicapa (λ = 100)
-reproduce las capas hasta 50 m; el conductor de 50–80 m sale como ~13 Ω·m hasta 95–100 m
-(misma conductancia), por equivalencia S.
+Con 3 % de ruido el error estimado por dato es ~2.1 % (3 %/√2) y las capas de 15–80 m
+no se distinguen de una sola capa de 28.6 Ω·m: el modelo de 4 capas ajusta igual que el
+verdadero (equivalencia).
 
 ### Modelo A (contrastes fuertes)
 
@@ -252,32 +279,42 @@ El modelo es:
 | 70–90 m | 300 | 3 |
 | > 90 m | 60 | 8 |
 
-**Curvas exactas (por defecto).**
-- El preprocesamiento no toca ningún dato.
-- El simplificado de Schlumberger (6 capas) recupera las interfaces de 2, 10.2, 18.6 y
-  34 m, con 10, 60, 8.5 y 369 Ω·m. El resistivo conserva su T (5650 contra 6000 Ω·m²).
-- El conductor de 40–70 m sale como 17 Ω·m hasta 70 m.
-- La capa resistiva de 70–90 m está bajo un conductor de 30 m (S = 3 siemens) y apenas
-  cambia la curva. El candidato de 7 capas la muestra (79–116 m, 175 Ω·m), pero su
-  mejora de ajuste no basta para que el BIC lo elija. Se puede revisar con
+**Curva exacta (S1).** El preprocesamiento no toca ningún dato. El BIC elige 6 capas:
+2 / 10.5 / 15.2 / 27.2 / 58.9 m con 10 / 59.7 / 4.7 / 473 / 14.9 / 64.7 Ω·m
+(χ² = 0.04, MAPE = 0.01 %, CV-MAPE = 0.03 %).
+- Las dos primeras interfaces salen exactas.
+- El conductor de 10–20 m conserva su conductancia (S = 4.7/4.7 ≈ 1.0 S, real 1.0 S) y el
+  resistivo de 20–40 m su resistencia transversal (T = 12.1 × 473 ≈ 5700 Ω·m², real 6000):
+  equivalencia S y T.
+- El candidato de 7 capas reproduce casi exactamente el modelo verdadero
+  (10 / 60 / 10 / 305 / 9.6 / 147 / 60 Ω·m), pero con datos exactos y piso de error de
+  0.1 % los dos tienen χ² < 1 y el BIC prefiere el más simple. Se puede revisar con
   "Capas fijas = 7".
 
 **Con `--ruido 0.10 --aberrantes --desplazamiento`.**
-- Detecta 18 de 18 lecturas aberrantes.
+- Detecta las lecturas aberrantes.
 - El ruido estimado es de 7–11 % (real: 10 %).
-- El BIC elige 3 capas. Con ese ruido, el modelo verdadero no ajusta mejor que el de
-  3 capas (principio de equivalencia).
+- Con ese ruido, el modelo verdadero no ajusta mejor que uno de 3 capas (principio de
+  equivalencia).
+
+### Sondeo tipo IPI2Win (5 capas, 3 % de ruido, solo ResApp)
+
+Real: 0.4 m · 46.7 / 0.6 m · 12.1 / 2.7 m · 787 / 7.9 m · 14.9 / 4812 Ω·m. Invertido:
+0.4 · 43.9 / 0.75 · 14.6 / 1.6 · 1290 / 4.7 · 11.9 / 323 Ω·m (χ² = 1.18, MAPE = 0.91 %,
+CV-MAPE = 2.3 %). El resistivo delgado conserva su T (2080 contra 2125 Ω·m²). Ninguna capa
+es más delgada que el mínimo resoluble.
 
 `ejemplos/construir_proyecto_demo.py` genera `Sinteticos_demo.isev` con todo procesado,
 el modelo verdadero como referencia y el perfil P1 con LCI.
 
-### Por qué el multicapa usa regularización nítida
+### Regularización del multicapa
 
-Con suavidad L2 (Occam clásico), cada salto de resistividad se reparte en varias capas.
-Al reducir ese modelo, las interfaces quedan en lugares equivocados: con curvas exactas,
-la capa de 300 Ω·m salía como 150 Ω·m de 25 a 50 m. Con soporte de gradiente mínimo, el
-multicapa sale por bloques (10 / 61 / 10 / 274 Ω·m con interfaces en 2, 10, 20 y 39 m) y
-Dar Zarrouk agrupa las capas reales.
+El estándar es Occam suave (L2): el multicapa es un modelo continuo y conservador, que
+sirve de referencia y de fuente para Dar Zarrouk. Con suavidad L2 los saltos se reparten
+en varias celdas; por eso el modelo de bloques ya no sale de reducir solo el multicapa:
+el paso 3 compara su reducción con la de Zohdy y el paso 4 explora con Optuna alrededor
+de ambas. La regularización robusta (L1 en los datos) conviene con datos ruidosos o con
+saltos de empalme; la nítida (gradiente mínimo) sigue disponible.
 
 Además:
 - Se desactivó el criterio de pyGIMLi que detiene la inversión al llegar a χ² < 1.

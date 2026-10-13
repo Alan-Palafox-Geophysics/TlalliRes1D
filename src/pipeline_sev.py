@@ -30,6 +30,7 @@ Este módulo no usa la sentencia ``elif``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import threading
@@ -125,6 +126,66 @@ class ConfigPipeline:
     prof_parametros: Optional[float] = None
     prof_corrosion: float = 3.0
     umbrales_corrosion: tuple = (5.0, 10.0, 20.0, 100.0)
+
+
+#: Archivo (en la carpeta del proyecto, viaja dentro del .isev) con los
+#: parámetros de procesamiento e inversión de la campaña.
+NOMBRE_PARAMETROS = "parametros_campana.json"
+
+
+def config_a_dict(config: "ConfigPipeline") -> dict[str, Any]:
+    """Configuración completa como diccionario serializable (JSON)."""
+    from dataclasses import asdict
+
+    datos = asdict(config)
+    datos["umbrales_corrosion"] = list(config.umbrales_corrosion)
+    return datos
+
+
+def config_desde_dict(datos: dict[str, Any]) -> "ConfigPipeline":
+    """Reconstruye la configuración; ignora claves desconocidas y completa
+    las que falten con los valores por omisión (archivos de versiones
+    anteriores siguen sirviendo)."""
+    from dataclasses import fields
+
+    def filtrar(clase, valores):
+        validos = {f.name for f in fields(clase)}
+        return clase(**{k: v for k, v in (valores or {}).items() if k in validos})
+
+    cfg = ConfigPipeline()
+    cfg.preproceso = filtrar(ConfigPreproceso, datos.get("preproceso"))
+    cfg.inversion = filtrar(ConfigInversion, datos.get("inversion"))
+    for clave in ("arreglo_forzado", "autoguardado", "prof_parametros", "prof_corrosion"):
+        if clave in datos:
+            setattr(cfg, clave, datos[clave])
+        else:
+            pass
+    if "umbrales_corrosion" in datos:
+        cfg.umbrales_corrosion = tuple(datos["umbrales_corrosion"])
+    else:
+        pass
+    return cfg
+
+
+def guardar_parametros(proyecto: Proyecto, config: "ConfigPipeline") -> Path:
+    """Guarda los parámetros de la campaña en el proyecto."""
+    ruta = proyecto.ruta / NOMBRE_PARAMETROS
+    ruta.write_text(json.dumps(config_a_dict(config), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return ruta
+
+
+def cargar_parametros(proyecto: Proyecto) -> Optional["ConfigPipeline"]:
+    """Parámetros guardados de la campaña (None si no hay)."""
+    ruta = proyecto.ruta / NOMBRE_PARAMETROS
+    if not ruta.exists():
+        return None
+    else:
+        pass
+    try:
+        return config_desde_dict(json.loads(ruta.read_text(encoding="utf-8")))
+    except Exception as exc:
+        logger.warning("No se pudieron leer los parámetros guardados: %s", exc)
+        return None
 
 
 ORDEN_ETAPAS = ("crudo", "promedio", "procesado", "inversion", "parametros")
@@ -251,7 +312,12 @@ def ejecutar_promedio(proyecto: Proyecto, sondeo: str, config: Optional[ConfigPi
 
         crudo = _requerir(proyecto, "crudo", "lectura", sondeo)
         pp = cfg.preproceso
-        corregido, informe = pr.corregir_empalmes(crudo, umbral=pp.umbral_empalme, activar=pp.corregir_empalmes,
+        # Archivo con solo AB/2, MN/2 y ρa (sin V, I, R ni K): los datos se
+        # toman tal cual, sin recalcular ni corregir empalmes; solo se
+        # suavizan (si se pide) y se invierten.
+        solo_resapp = all(c not in crudo or crudo[c].isna().all() for c in ("V", "I", "R", "K"))
+        corregido, informe = pr.corregir_empalmes(crudo, umbral=pp.umbral_empalme,
+                                                  activar=pp.corregir_empalmes and not solo_resapp,
                                                   arreglo=arreglo_sondeo(proyecto, sondeo))
         promedio, metricas, adv = pr.promediar_direcciones(corregido)
         metricas["n_empalmes_corregidos"] = int(sum(1 for i in informe if i["aplicado"]))
@@ -280,7 +346,18 @@ def ejecutar_procesamiento(proyecto: Proyecto, sondeo: str, config: Optional[Con
 
         promedio = _requerir(proyecto, "promedio", "promedio", sondeo)
         arreglo = arreglo_sondeo(proyecto, sondeo)
-        procesado, metricas, adv = pr.preprocesar(promedio, cfg.preproceso, arreglo=arreglo)
+        config_pre = cfg.preproceso
+        if config_pre.escala_campana <= 0:
+            # Tendencia de la campaña: escala mediana de residuales de los
+            # demás sondeos ya procesados (si los hay).
+            escala_c = escala_campana(proyecto, excluir=sondeo)
+            if escala_c is not None:
+                config_pre = dataclasses.replace(config_pre, escala_campana=escala_c)
+            else:
+                pass
+        else:
+            pass
+        procesado, metricas, adv = pr.preprocesar(promedio, config_pre, arreglo=arreglo)
         metricas["config"] = json.dumps(cfg.preproceso.as_dict(), default=str)
         if guardar:
             alm.guardar_tabla(proyecto, procesado, "procesado", "procesado", sondeo, metricas=metricas)
@@ -313,7 +390,8 @@ def ejecutar_inversion(proyecto: Proyecto, sondeo: str, config: Optional[ConfigP
         if guardar:
             for tabla, df in (("multicapa", res.multicapa), ("simplificado", res.simplificado),
                               ("ajuste", res.ajuste), ("seleccion", res.seleccion),
-                              ("lambdas", res.lambdas), ("zohdy", res.zohdy)):
+                              ("lambdas", res.lambdas), ("zohdy", res.zohdy),
+                              ("pruebas_bloques", res.pruebas_bloques), ("proceso", res.proceso)):
                 if df is not None:
                     alm.guardar_tabla(proyecto, df, "inversion", tabla, sondeo)
                 else:
@@ -528,6 +606,22 @@ def ejecutar_pipeline_archivo(
         pass
 
     nombres = lectura.datos["sondeos"]
+    orden = list(ORDEN_ETAPAS)
+    # Primera pasada: promedio y preprocesamiento de TODOS los sondeos, para
+    # conocer la dispersión típica de la campaña. La segunda pasada repite el
+    # preprocesamiento con esa escala de campaña (un dato solo es anómalo si
+    # sale de la tendencia de su sondeo y de la de la campaña) y continúa.
+    dos_pasadas = (len(nombres) > 1 and orden.index(hasta_etapa) >= orden.index("procesado")
+                   and cfg.preproceso.escala_campana <= 0)
+    if dos_pasadas:
+        for nombre in nombres:
+            ejecutar_pipeline_sondeo(proyecto, nombre, cfg, "promedio", "procesado", None, token_cancelacion)
+            if token_cancelacion is not None and token_cancelacion.cancelado:
+                return salida
+            else:
+                pass
+    else:
+        pass
     for i, nombre in enumerate(nombres):
         def _cb(etapa, indice, total, resultado, _i=i):
             if callback_progreso is not None:
@@ -536,8 +630,9 @@ def ejecutar_pipeline_archivo(
             else:
                 pass
 
+        desde = "procesado" if dos_pasadas else "promedio"
         salida["sondeos"][nombre] = ejecutar_pipeline_sondeo(
-            proyecto, nombre, cfg, "promedio", hasta_etapa, _cb, token_cancelacion)
+            proyecto, nombre, cfg, desde, hasta_etapa, _cb, token_cancelacion)
         if token_cancelacion is not None and token_cancelacion.cancelado:
             break
         else:
@@ -567,6 +662,37 @@ def metrica(proyecto: Proyecto, sondeo: str, etapa: str, clave: str) -> Optional
         return None
     else:
         return float(fila["valor_num"].iloc[0])
+
+
+def escala_campana(proyecto: Proyecto, excluir: Optional[str] = None) -> Optional[float]:
+    """Escala robusta típica de residuales de la campaña (mediana entre sondeos).
+
+    Se usa para que un dato solo se declare anómalo si se aparta tanto de la
+    tendencia de su propio sondeo como de la dispersión habitual de toda la
+    campaña. ``None`` si no hay otros sondeos procesados.
+    """
+    try:
+        nombres = [str(s) for s in alm.listar_sondeos(proyecto)["sondeo"]]
+    except Exception:
+        return None
+    valores = []
+    for nombre in nombres:
+        if excluir is not None and nombre == str(excluir):
+            continue
+        else:
+            pass
+        try:
+            valor = metrica(proyecto, nombre, "procesado", "escala_residual")
+        except Exception:
+            valor = None
+        if valor is not None and np.isfinite(valor) and valor > 0:
+            valores.append(valor)
+        else:
+            pass
+    if not valores:
+        return None
+    else:
+        return float(np.median(valores))
 
 
 def arreglo_sondeo(proyecto: Proyecto, sondeo: str) -> str:

@@ -706,6 +706,7 @@ class ConfigPreproceso:
     verificar_pendiente: bool = True
     ip_umbral_abs: float = 2.0
     arreglo_forzado: Optional[str] = None
+    escala_campana: float = 0.0
 
     def efectiva(self) -> "ConfigPreproceso":
         """En modo Auto, los parámetros por defecto (física + umbrales)."""
@@ -713,7 +714,7 @@ class ConfigPreproceso:
             return ConfigPreproceso(
                 modo="Auto", corregir_empalmes=self.corregir_empalmes,
                 arreglo_forzado=self.arreglo_forzado, piso_error=self.piso_error,
-                tratamiento=self.tratamiento,
+                tratamiento=self.tratamiento, escala_campana=self.escala_campana,
             )
         else:
             return self
@@ -828,8 +829,21 @@ def preprocesar(
     # datos muy limpios el piso evita pesos infinitos.
     error_base = np.maximum(cfg.piso_error, ruido_dir / np.sqrt(n_dir))
 
-    anomalo_estadistico = (np.abs(z) > cfg.umbral_z) & (np.abs(residuo) > np.log1p(cfg.umbral_rel))
-    disperso = (sigma > cfg.umbral_disp) & (sigma > 2.5 * ruido_dir)
+    # Un dato solo es anómalo si se sale de la tendencia del PROPIO sondeo
+    # (z robusto respecto a su curva de referencia) Y de la tendencia de la
+    # CAMPAÑA: la escala de residuales de los demás sondeos. Así, un sondeo
+    # ruidoso por naturaleza no pierde datos por comparar su ruido consigo
+    # mismo, y un salto que es habitual en toda la campaña no se descarta.
+    escala_ref = max(escala, cfg.escala_campana) if cfg.escala_campana > 0 else escala
+    z_campana = residuo / escala_ref
+    anomalo_estadistico = ((np.abs(z) > cfg.umbral_z) & (np.abs(z_campana) > cfg.umbral_z)
+                           & (np.abs(residuo) > np.log1p(cfg.umbral_rel)))
+    # Con 2 direcciones no se puede saber cuál es la buena: se promedian
+    # geométricamente y la discrepancia solo aumenta el error del dato (no se
+    # marca como anómalo ni se descarta ninguna dirección). Con 3 o más
+    # direcciones sí hay mayoría para decidir.
+    disperso = (sigma > cfg.umbral_disp) & (sigma > 2.5 * ruido_dir) & (n_dir >= 3)
+    error_base = np.maximum(error_base, sigma / np.sqrt(n_dir))
     pendiente = np.zeros(len(tabla), dtype=bool)
     if cfg.verificar_pendiente and arreglo in ("SCH", "WE"):
         pendiente = _violaciones_pendiente(tabla["AB2"].to_numpy(float), rho, residuo)
@@ -848,12 +862,13 @@ def preprocesar(
     tolerancia = max(np.log1p(cfg.umbral_rel), 2.0 * escala)
     for i in np.where(disperso | anomalo_estadistico)[0]:
         valores = {c[5:]: tabla.at[i, c] for c in columnas_dir if np.isfinite(tabla.at[i, c])}
-        if len(valores) < 2:
+        if len(valores) < 3:
+            # Con 2 direcciones no hay mayoría: se conserva la media geométrica.
             continue
         else:
             pass
         buenas = {d: v for d, v in valores.items() if abs(np.log(v / referencia[i])) <= tolerancia}
-        if 0 < len(buenas) < len(valores):
+        if len(valores) / 2 < len(buenas) < len(valores):
             rho_coherente[i] = float(np.exp(np.mean(np.log(list(buenas.values())))))
             descartadas[i] = ",".join(sorted(set(valores) - set(buenas)))
         else:
@@ -973,6 +988,8 @@ def preprocesar(
         "error_mediano": float(np.median(error_rel)),
         "ruido_por_direccion": ruido_dir,
         "n_direcciones_descartadas": int(rescatado.sum()),
+        "escala_residual": float(escala),
+        "escala_campana": float(cfg.escala_campana),
         "umbral_rel": cfg.umbral_rel,
         "tiene_ip": tiene_ip,
     }

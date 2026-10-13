@@ -38,9 +38,9 @@ COLOR = {
     "preprocesado": "#00838F",
     "referencia": "#5E6A75",
     "anomalo": "#D62828",
-    "multicapa": "#F28C28",
-    "simplificado": "#1D3D8F",
-    "zohdy": "#B5A642",
+    "multicapa": "#F28C28",      # naranja, grosor normal
+    "simplificado": "#0000FF",   # modelo invertido: azul (0, 0, 255), fuerte y claro
+    "zohdy": "#E6B800",          # amarillo, delgado
     "real": "#111111",
     "doi": "#7B2CBF",
     "ip": "#8A5FBF",
@@ -320,7 +320,7 @@ def ajuste_inversion(ajuste: pd.DataFrame, mostrar_zohdy: bool = False,
     if mostrar_zohdy and "rhoa_zohdy" in a:
         xs, ys = _por_tramo(a, "rhoa_zohdy")
         figura.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Calculada · Zohdy",
-                                    line=dict(color=COLOR["zohdy"], width=2, dash="dot")), row=1, col=1)
+                                    line=dict(color=COLOR["zohdy"], width=1.3, dash="dot")), row=1, col=1)
         if "error_zohdy_pct" in a:
             figura.add_trace(go.Scatter(x=a["AB2"], y=a["error_zohdy_pct"], mode="markers+lines", showlegend=False,
                                         name="error Zohdy", line=dict(color=COLOR["zohdy"], width=1, dash="dot"),
@@ -331,10 +331,10 @@ def ajuste_inversion(ajuste: pd.DataFrame, mostrar_zohdy: bool = False,
         pass
     xs, ys = _por_tramo(a, "rhoa_multicapa")
     figura.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Calculada · multicapa",
-                                line=dict(color=COLOR["multicapa"], width=2.5)), row=1, col=1)
+                                line=dict(color=COLOR["multicapa"], width=2)), row=1, col=1)
     xs, ys = _por_tramo(a, "rhoa_simplificado")
-    figura.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Calculada · simplificado",
-                                line=dict(color=COLOR["simplificado"], width=2, dash="dash")), row=1, col=1)
+    figura.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Calculada · bloques (invertido)",
+                                line=dict(color=COLOR["simplificado"], width=2.5)), row=1, col=1)
     for nombre, col, color in (("multicapa", "error_multicapa_pct", COLOR["multicapa"]),
                                ("simplificado", "error_simplificado_pct", COLOR["simplificado"])):
         figura.add_trace(go.Scatter(x=a["AB2"], y=a[col], mode="markers+lines", showlegend=False,
@@ -398,10 +398,10 @@ def modelos_resistividad(
         abajo = rho_s - np.maximum(simplificado["rho_min"].to_numpy(float), rho_s / 10)
         visibles = techos < z_max
         barras = go.Scatter(
-            x=rho_s[visibles], y=medios[visibles], mode="markers", name="Simplificado ±1σ (ρ)",
+            x=rho_s[visibles], y=medios[visibles], mode="markers", name="Bloques ±1σ (ρ)",
             marker=dict(color=COLOR["simplificado"], size=5),
             error_x=dict(type="data", symmetric=False, array=arriba[visibles], arrayminus=abajo[visibles],
-                         color="rgba(29,61,143,0.55)", thickness=1.5, width=4),
+                         color="rgba(0,0,255,0.45)", thickness=1.5, width=4),
             hovertemplate="ρ=%{x:.3g} Ω·m<extra>±1σ</extra>",
         )
     else:
@@ -416,7 +416,7 @@ def modelos_resistividad(
         # Modelo de Zohdy propio: una capa por dato, con sus profundidades.
         x, z = _escalones(zohdy, "rho", z_max)
         figura.add_trace(go.Scatter(x=x, y=z, mode="lines", name=f"Zohdy ({len(zohdy)} capas)",
-                                    line=dict(color=COLOR["zohdy"], width=1.6)))
+                                    line=dict(color=COLOR["zohdy"], width=1.2)))
     else:
         pass
     sin_tabla_zohdy = mostrar_zohdy and (zohdy is None or not len(zohdy))
@@ -430,7 +430,7 @@ def modelos_resistividad(
     if multicapa is not None:
         x, z = _escalones(multicapa, "rho", z_max)
         figura.add_trace(go.Scatter(x=x, y=z, mode="lines", name="Multicapa",
-                                    line=dict(color=COLOR["multicapa"], width=2.5)))
+                                    line=dict(color=COLOR["multicapa"], width=2)))
     else:
         pass
     if simplificado is not None:
@@ -438,7 +438,7 @@ def modelos_resistividad(
         texto = [f"Capa {c}: {r:.3g} Ω·m · {h:.3g} m · {res}" for c, r, h, res in zip(
             simplificado["capa"], simplificado["rho"], simplificado["espesor"],
             simplificado.get("resolucion", [""] * len(simplificado)))]
-        figura.add_trace(go.Scatter(x=x, y=z, mode="lines", name="Simplificado",
+        figura.add_trace(go.Scatter(x=x, y=z, mode="lines", name="Invertido (bloques)",
                                     line=dict(color=COLOR["simplificado"], width=3),
                                     text=np.repeat(texto, 2), hovertemplate="%{text}<br>z=%{y:.3g} m<extra></extra>"))
     else:
@@ -470,6 +470,7 @@ def modelos_resistividad(
 def parametros_acumulados(
     multicapa: Optional[pd.DataFrame], simplificado: Optional[pd.DataFrame],
     doi: Optional[float] = None, real: Optional[pd.DataFrame] = None, z_max: float = 100.0,
+    zohdy: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
     """Parámetros de Dar Zarrouk acumulados desde la superficie hasta z.
 
@@ -495,13 +496,24 @@ def parametros_acumulados(
     else:
         pass
     z = np.linspace(0.0, float(z_max), 400)[1:]
-    figura = make_subplots(rows=1, cols=5, shared_yaxes=True, horizontal_spacing=0.03,
-                           column_widths=[1.0, 1.0, 1.0, 0.6, 0.7],
-                           subplot_titles=("T acumulada", "S acumulada", "ρ promedio 0–z",
+    figura = make_subplots(rows=1, cols=6, shared_yaxes=True, horizontal_spacing=0.025,
+                           column_widths=[1.1, 1.0, 1.0, 1.0, 0.6, 0.7],
+                           subplot_titles=("Modelos de inversión", "T acumulada", "S acumulada", "ρ promedio 0–z",
                                            "Pseudo-anisotropía λ", "Contraste por capa"))
     series = [(real, "Modelo de referencia", dict(color="rgba(17,17,17,0.35)", width=5)),
-              (multicapa, "Multicapa", dict(color=COLOR["multicapa"], width=2.5)),
-              (simplificado, "Simplificado", dict(color=COLOR["simplificado"], width=2, dash="dash"))]
+              (multicapa, "Multicapa", dict(color=COLOR["multicapa"], width=2)),
+              (simplificado, "Invertido (bloques)", dict(color=COLOR["simplificado"], width=3))]
+    # Panel 1: los modelos de inversión (Zohdy, multicapa, invertido).
+    for modelo, nombre, linea in ([(real, "Modelo de referencia", dict(color="rgba(17,17,17,0.35)", width=5)),
+                                   (zohdy, "Zohdy", dict(color=COLOR["zohdy"], width=1.2))] + series[1:]):
+        if modelo is None or not len(modelo):
+            continue
+        else:
+            pass
+        x, zz = _escalones(modelo, "rho", z_max)
+        figura.add_trace(go.Scatter(x=x, y=zz, mode="lines", name=nombre, line=linea, legendgroup=nombre,
+                                    hovertemplate="z=%{y:.1f} m<br>ρ=%{x:.3g} Ω·m<extra>" + nombre + "</extra>"),
+                         row=1, col=1)
     ejes = {1: [], 2: [], 3: [], 4: []}
     for modelo, nombre, linea in series:
         if modelo is None or not len(modelo):
@@ -515,9 +527,9 @@ def parametros_acumulados(
         for col, valores, unidad in ((1, T, "Ω·m²"), (2, S, "S"), (3, rm, "Ω·m"), (4, lam, "")):
             ejes[col].append(valores)
             figura.add_trace(go.Scatter(
-                x=valores, y=z, mode="lines", name=nombre, line=linea, legendgroup=nombre, showlegend=col == 1,
+                x=valores, y=z, mode="lines", name=nombre, line=linea, legendgroup=nombre, showlegend=False,
                 hovertemplate="z=%{y:.1f} m<br>%{x:.4g} " + unidad + "<extra>" + nombre + "</extra>",
-            ), row=1, col=col)
+            ), row=1, col=col + 1)
     # Contraste por capa (simplificado; el de referencia como contorno).
     for modelo, nombre, relleno in ((real, "Referencia", False), (simplificado, "Simplificado", True)):
         if modelo is None or not len(modelo):
@@ -542,29 +554,129 @@ def parametros_acumulados(
             customdata=np.stack([c, techos, bases], axis=-1), showlegend=False,
             hovertemplate=("capa %{customdata[1]:.1f}–%{customdata[2]:.1f} m<br>ρ capa / ρ promedio de arriba = "
                            "×%{customdata[0]:.2f}<extra>" + nombre + "</extra>"),
-        ), row=1, col=5)
+        ), row=1, col=6)
     for umbral in (-1.0, 1.0):
-        figura.add_vline(x=umbral, line=dict(color="#999", dash="dot", width=1), row=1, col=5)
-    figura.add_vline(x=0.0, line=dict(color="#666", width=1), row=1, col=5)
+        figura.add_vline(x=umbral, line=dict(color="#999", dash="dot", width=1), row=1, col=6)
+    figura.add_vline(x=0.0, line=dict(color="#666", width=1), row=1, col=6)
     figura.update_xaxes(title="ρ capa / ρ prom. arriba", tickvals=[-3, -2, -1, 0, 1, 2, 3],
                         ticktext=["×⅛", "×¼", "×½", "×1", "×2", "×4", "×8"], range=[-3.6, 3.6],
-                        showgrid=True, gridcolor="#E6E6E6", row=1, col=5)
+                        showgrid=True, gridcolor="#E6E6E6", row=1, col=6)
+    valores_rho = [m["rho"].to_numpy(float) for m in (real, zohdy, multicapa, simplificado)
+                   if m is not None and len(m)]
+    vals_rho = np.concatenate(valores_rho) if valores_rho else np.array([1.0, 100.0])
+    figura.update_xaxes(type="log", title="ρ (Ω·m)", showgrid=True, gridcolor="#E6E6E6", row=1, col=1,
+                        **marcas_log(vals_rho[np.isfinite(vals_rho) & (vals_rho > 0)]))
     for col, titulo in ((1, "T (Ω·m²)"), (2, "S (siemens)"), (3, "ρ promedio (Ω·m)")):
         vals = np.concatenate(ejes[col]) if ejes[col] else np.array([1.0, 10.0])
         vals = vals[np.isfinite(vals) & (vals > 0)]
-        figura.update_xaxes(type="log", title=titulo, showgrid=True, gridcolor="#E6E6E6", row=1, col=col,
+        figura.update_xaxes(type="log", title=titulo, showgrid=True, gridcolor="#E6E6E6", row=1, col=col + 1,
                             **marcas_log(vals))
     lam_max = float(np.nanmax(np.concatenate(ejes[4]))) if ejes[4] else 1.5
     figura.update_xaxes(title="λ = √(ρT/ρL)", range=[0.98, max(1.1, lam_max * 1.05)], showgrid=True,
-                        gridcolor="#E6E6E6", row=1, col=4)
-    for col in range(1, 6):
+                        gridcolor="#E6E6E6", row=1, col=5)
+    for col in range(1, 7):
         if doi and doi <= z_max:
             figura.add_hline(y=doi, line=dict(color=COLOR["doi"], dash="dash", width=1.2), row=1, col=col)
         else:
             pass
         figura.update_yaxes(range=[z_max, 0], showgrid=True, gridcolor="#E6E6E6", row=1, col=col)
     figura.update_yaxes(title="Profundidad (m)", row=1, col=1)
-    figura.update_layout(template=PLANTILLA, height=580, title="Parámetros acumulados de Dar Zarrouk", bargap=0,
+    figura.update_layout(template=PLANTILLA, height=600,
+                         title="Interpretación geoeléctrica: modelos y parámetros de Dar Zarrouk", bargap=0,
+                         legend=dict(orientation="h", y=-0.15), margin=dict(l=60, r=20, t=70, b=40))
+    return figura
+
+
+COLORES_CORROSIVIDAD = {"Muy alta": "#B2182B", "Alta": "#EF6548", "Moderada": "#FDB863",
+                        "Baja": "#A6D96A", "Muy baja": "#1A9850"}
+
+
+def corrosividad(
+    simplificado: Optional[pd.DataFrame], multicapa: Optional[pd.DataFrame] = None, z_max: float = 20.0,
+    umbrales=(5.0, 10.0, 20.0, 100.0), prof_corrosion: float = 3.0,
+) -> go.Figure:
+    """Corrosividad del suelo estimada con el modelo invertido.
+
+    1. Modelo de resistividad sobre las franjas de clase (ρ < 5: muy alta,
+       5–10: alta, 10–20: moderada, 20–100: baja, > 100 Ω·m: muy baja; escala
+       de protección catódica NACE/Roberge).
+    2. Clase de cada capa del modelo invertido.
+    3. Clase del suelo de 0 a z con la resistividad longitudinal ρL(z) =
+       z / S(z), la que ve una corriente de corrosión (dominada por las
+       capas conductoras); se marca la profundidad de evaluación.
+    """
+    import parametros_sev as ps
+
+    if simplificado is None or not len(simplificado):
+        return _vacia("Sin modelo invertido")
+    else:
+        pass
+    clases = list(COLORES_CORROSIVIDAD)
+    limites = [1e-3] + list(umbrales) + [1e6]
+    figura = make_subplots(rows=1, cols=3, shared_yaxes=True, horizontal_spacing=0.05,
+                           column_widths=[1.2, 0.6, 1.2],
+                           subplot_titles=("Modelo invertido y clases de corrosividad", "Clase por capa",
+                                           "Suelo de 0 a z (ρL acumulada)"))
+    for col in (1, 3):
+        for clase, x0, x1 in zip(clases, limites[:-1], limites[1:]):
+            # plotly 6+ (plotly.js 3): las figuras en ejes log usan valores de datos.
+            figura.add_vrect(x0=x0, x1=x1, fillcolor=COLORES_CORROSIVIDAD[clase],
+                             opacity=0.18, line_width=0, layer="below", row=1, col=col,
+                             exclude_empty_subplots=False)
+    if multicapa is not None and len(multicapa):
+        x, zz = _escalones(multicapa, "rho", z_max)
+        figura.add_trace(go.Scatter(x=x, y=zz, mode="lines", name="Multicapa",
+                                    line=dict(color=COLOR["multicapa"], width=2)), row=1, col=1)
+    else:
+        pass
+    x, zz = _escalones(simplificado, "rho", z_max)
+    figura.add_trace(go.Scatter(x=x, y=zz, mode="lines", name="Invertido (bloques)",
+                                line=dict(color=COLOR["simplificado"], width=3)), row=1, col=1)
+    # Clase por capa
+    for fila in simplificado.itertuples():
+        if fila.z_techo >= z_max:
+            continue
+        else:
+            pass
+        clase = ps.clase_corrosividad(float(fila.rho), umbrales)
+        base = min(float(fila.z_base) if np.isfinite(fila.z_base) else z_max, z_max)
+        figura.add_trace(go.Bar(
+            x=[1.0], y=[(fila.z_techo + base) / 2], width=[(base - fila.z_techo) * 0.96], orientation="h",
+            marker=dict(color=COLORES_CORROSIVIDAD.get(clase, "#CCC"), line=dict(color="#FFFFFF", width=1)),
+            text=[f"{clase}<br>{fila.rho:.3g} Ω·m"], textposition="inside", insidetextanchor="middle",
+            showlegend=False, hovertemplate=f"{fila.z_techo:.2f}–{base:.2f} m · {clase}<extra></extra>",
+        ), row=1, col=2)
+    # ρL acumulada
+    z = np.linspace(0.0, float(z_max), 300)[1:]
+    S = ps.curva_acumulada(simplificado, z, "S")
+    rho_l = z / S
+    figura.add_trace(go.Scatter(x=rho_l, y=z, mode="lines", name="ρL de 0 a z",
+                                line=dict(color="#111111", width=2.5)), row=1, col=3)
+    if prof_corrosion and prof_corrosion <= z_max:
+        rl = float(prof_corrosion / ps.curva_acumulada(simplificado, [prof_corrosion], "S")[0])
+        clase = ps.clase_corrosividad(rl, umbrales)
+        figura.add_trace(go.Scatter(x=[rl], y=[prof_corrosion], mode="markers+text", name="Evaluación",
+                                    marker=dict(size=11, color="#111111", symbol="diamond"),
+                                    text=[f"  0–{prof_corrosion:g} m: {clase} ({rl:.3g} Ω·m)"],
+                                    textposition="middle right", showlegend=False), row=1, col=3)
+    else:
+        pass
+    todos = np.concatenate([simplificado["rho"].to_numpy(float), rho_l])
+    todos = todos[np.isfinite(todos) & (todos > 0)]
+    rango = [np.log10(max(min(todos.min() / 2, 2.0), 1e-2)), np.log10(max(todos.max() * 2, 200.0))]
+    for col in (1, 3):
+        figura.update_xaxes(type="log", range=rango, title="ρ (Ω·m)", showgrid=True, gridcolor="#E6E6E6",
+                            row=1, col=col)
+    figura.update_xaxes(visible=False, range=[0, 1], row=1, col=2)
+    for col in (1, 2, 3):
+        figura.update_yaxes(range=[z_max, 0], showgrid=True, gridcolor="#E6E6E6", row=1, col=col)
+    figura.update_yaxes(title="Profundidad (m)", row=1, col=1)
+    for clase in clases:
+        figura.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name=f"Corrosividad {clase.lower()}",
+                                    marker=dict(size=12, symbol="square", color=COLORES_CORROSIVIDAD[clase])),
+                         row=1, col=1)
+    figura.update_layout(template=PLANTILLA, height=520, bargap=0,
+                         title="Corrosividad del suelo estimada con el modelo invertido",
                          legend=dict(orientation="h", y=-0.15), margin=dict(l=60, r=20, t=70, b=40))
     return figura
 
@@ -581,9 +693,9 @@ def ajuste_ip(ajuste: pd.DataFrame) -> go.Figure:
                                 marker=dict(color=COLOR["ip"], size=7),
                                 error_y=dict(type="data", array=a["error_ip"], color="#C9B6E4")))
     figura.add_trace(go.Scatter(x=a["AB2"], y=a["ip_multicapa"], mode="lines", name="Calculada · multicapa",
-                                line=dict(color=COLOR["multicapa"], width=2.5)))
+                                line=dict(color=COLOR["multicapa"], width=2)))
     figura.add_trace(go.Scatter(x=a["AB2"], y=a["ip_simplificado"], mode="lines",
-                                name="Calculada · simplificado",
+                                name="Calculada · bloques (invertido)",
                                 line=dict(color=COLOR["simplificado"], dash="dash", width=2)))
     figura.update_xaxes(type="log", title="AB/2 (m)", **marcas_log(a["AB2"]))
     figura.update_yaxes(title="Cargabilidad aparente (mV/V)")
@@ -610,7 +722,7 @@ def modelos_ip(multicapa, simplificado, doi=None, real=None, z_max=None) -> go.F
     else:
         pass
     for modelo, nombre, color, ancho in ((multicapa, "Multicapa", COLOR["multicapa"], 2.5),
-                                         (simplificado, "Simplificado", COLOR["simplificado"], 3)):
+                                         (simplificado, "Invertido (bloques)", COLOR["simplificado"], 3)):
         if modelo is not None:
             x, z = _escalones(modelo, "m_ip", z_max)
             figura.add_trace(go.Scatter(x=x, y=z, mode="lines", name=nombre, line=dict(color=color, width=ancho)))
