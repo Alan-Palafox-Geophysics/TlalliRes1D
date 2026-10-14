@@ -167,6 +167,15 @@ with st.container(border=True):
         float(ci.espesor_min_fraccion), 0.05, key="sl_hmin",
         help=("La primera capa, además, no puede ser más delgada que la profundidad de investigación de la "
               "apertura más corta. 0 = sin restricción (no recomendado).")))
+    if ci.modo_bloques == "dar_zarrouk" and not ci.k_fijo:
+        ci.k_desde_estructura = st.checkbox(
+            "Número de capas según la estructura de Zohdy/multicapa (Dar Zarrouk)",
+            value=bool(ci.k_desde_estructura), key="chk_kdz",
+            help=("Se conservan las capas que la reducción de Dar Zarrouk de la fuente elegida muestra como "
+                  "distintas (contraste ≥ 1.5) salvo que los datos den evidencia fuerte en contra (ΔBIC > 6). "
+                  "Desactivado: k solo por el criterio de información (ΔIC < 2 → el más simple)."))
+    else:
+        pass
 
     st.markdown("**Otros**")
     c = st.columns(3)

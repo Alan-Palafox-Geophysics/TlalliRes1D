@@ -92,6 +92,12 @@ with st.container(border=True):
         pp.ip_umbral_abs = c[2].number_input("Umbral de IP (mV/V)", 0.1, 50.0, pp.ip_umbral_abs, key="n_ipu")
     else:
         pass
+    pp.error_por_discrepancia = st.checkbox(
+        "Aumentar el error de los puntos donde las direcciones discrepan", value=pp.error_por_discrepancia,
+        key="chk_err_disc",
+        help=("Activado: el error del punto es al menos la dispersión entre sus direcciones / √n, así que los "
+              "puntos donde las direcciones no coinciden pesan menos en la inversión. Desactivado: todos los "
+              "puntos usan el ruido agrupado del sondeo (pesan igual)."))
     config.preproceso = pp
     estado.fijar_config(config)
     st.caption(

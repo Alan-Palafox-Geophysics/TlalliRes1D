@@ -234,7 +234,13 @@ def prueba_dos_direcciones_media_geometrica():
     assert met["n_direcciones_descartadas"] == 0
     ab = df.loc[fila, "AB2"]
     i = int(np.argmin(np.abs(proc["AB2"] - ab) + 100 * (proc["MN2"] != df.loc[fila, "MN2"])))
-    assert proc["error_rel"].iloc[i] >= 0.9 * proc["sigma_dir"].iloc[i] / np.sqrt(2), proc.iloc[i]
+    # Opcional: la discrepancia eleva su error (por omisión conserva el
+    # error agrupado del sondeo, salvo que sea anómalo).
+    proc2, _, _ = _procesar(df, pr.ConfigPreproceso(error_por_discrepancia=True))
+    assert proc2["error_rel"].iloc[i] >= 0.9 * proc2["sigma_dir"].iloc[i] / np.sqrt(2), proc2.iloc[i]
+    assert proc2["error_rel"].iloc[i] >= proc["error_rel"].iloc[i]
+    normales = ~proc["anomalo"].to_numpy()
+    assert np.ptp(proc["error_rel"].to_numpy()[normales]) < 1e-9   # error agrupado, igual en todos
 
 
 def prueba_tres_direcciones_descarta_discrepante():

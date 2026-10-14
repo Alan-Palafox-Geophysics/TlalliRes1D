@@ -707,6 +707,7 @@ class ConfigPreproceso:
     ip_umbral_abs: float = 2.0
     arreglo_forzado: Optional[str] = None
     escala_campana: float = 0.0
+    error_por_discrepancia: bool = False
 
     def efectiva(self) -> "ConfigPreproceso":
         """En modo Auto, los parámetros por defecto (física + umbrales)."""
@@ -715,6 +716,7 @@ class ConfigPreproceso:
                 modo="Auto", corregir_empalmes=self.corregir_empalmes,
                 arreglo_forzado=self.arreglo_forzado, piso_error=self.piso_error,
                 tratamiento=self.tratamiento, escala_campana=self.escala_campana,
+                error_por_discrepancia=self.error_por_discrepancia,
             )
         else:
             return self
@@ -843,7 +845,10 @@ def preprocesar(
     # marca como anómalo ni se descarta ninguna dirección). Con 3 o más
     # direcciones sí hay mayoría para decidir.
     disperso = (sigma > cfg.umbral_disp) & (sigma > 2.5 * ruido_dir) & (n_dir >= 3)
-    error_base = np.maximum(error_base, sigma / np.sqrt(n_dir))
+    if cfg.error_por_discrepancia:
+        error_base = np.maximum(error_base, sigma / np.sqrt(n_dir))
+    else:
+        pass
     pendiente = np.zeros(len(tabla), dtype=bool)
     if cfg.verificar_pendiente and arreglo in ("SCH", "WE"):
         pendiente = _violaciones_pendiente(tabla["AB2"].to_numpy(float), rho, residuo)

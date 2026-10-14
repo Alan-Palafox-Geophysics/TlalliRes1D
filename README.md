@@ -87,10 +87,13 @@ en dipolo-dipolo y polo-dipolo sí. Aquí se llama al núcleo con el orden corre
 **Promedio de direcciones.** Media geométrica (log ρa) sobre la geometría de la dirección
 con más datos; las demás se interpolan en log-log sin extrapolar. El ruido por dirección
 se estima **agrupado** (mediana de varianzas corregida por el sesgo de χ²ν) y el error de
-cada punto es el mayor entre σ_agrupada/√n y la dispersión de ese punto /√n.
+cada punto es σ_agrupada/√n.
 - **Con 2 direcciones** no se puede saber cuál es la buena: siempre se usa la media
-  geométrica y nunca se descarta una dirección. Si discrepan, solo aumenta el error del
-  dato (pesa menos en la inversión).
+  geométrica y nunca se descarta una dirección. Por omisión el punto conserva el error
+  agrupado del sondeo. Opcionalmente ("Aumentar el error de los puntos donde las
+  direcciones discrepan") su error sube a la dispersión entre direcciones / √n y pesa
+  menos; con discrepancias grandes en las aperturas mayores eso puede dejar sin soporte a
+  las capas profundas.
 - **Con 3 o más direcciones** hay mayoría: si una discrepa de la referencia y las demás
   no, se descarta la discrepante y se rehace el promedio con las coherentes.
 
@@ -140,7 +143,11 @@ reproduce la observada. Se prueban varios n y cada uno se evalúa con Zohdy comp
 del modelo de Zohdy.
 - **Malla:** las interfaces de Zohdy subdivididas en log z (~50 celdas) hasta la
   **profundidad máxima viable** f·máx(z_e), donde f es el factor de profundidad que mejor
-  ajusta. La malla logarítmica sigue disponible.
+  ajusta. Cada capa de Zohdy se parte en varias celdas con la misma ρ inicial (13 capas
+  de Zohdy → ~40–50 celdas), así que el modelo inicial es exactamente Zohdy, pero el
+  multicapa puede mover los cambios de ρ dentro de cada capa de Zohdy en vez de quedar
+  amarrado a sus interfaces, que dependen del n elegido. La malla logarítmica sigue
+  disponible.
 - **Regularización:** Occam suave (L2) por omisión; **robusta** (L1 en los datos, IRLS de
   pyGIMLi, resiste datos malos) seleccionable; nítida (gradiente mínimo) como opción.
 - **λ por Optuna:** se minimiza |ln χ²| + 0.1·rugosidad + una penalización por
@@ -165,10 +172,21 @@ viables:
 Primero se encolan todos los arranques base de cada k; luego vienen las pruebas de
 búsqueda (40 por omisión). Cada prueba es un Levenberg–Marquardt acotado (SciPy,
 jacobiano analítico) con **espesor mínimo obligatorio**. Los 5 mejores de cada k se
-refinan hasta converger. k se elige por BIC (o AIC); con ΔIC < 2 gana el más simple.
-Entre ajustes equivalentes (Δφ ≤ 0.25) gana el de **mínima estructura**, Σ(Δ ln ρ)². El
-elegido se pule con la inversión de bloques de pyGIMLi si mejora el ajuste, y se funden
-capas contiguas casi iguales.
+refinan hasta converger.
+
+Número de capas:
+- **Estructura de la fuente:** la reducción de Dar Zarrouk de la fuente elegida (Zohdy o
+  multicapa) dice cuántas capas distintas muestra: el mayor k cuyas capas vecinas tienen
+  todas contraste ≥ 1.5, dentro de la profundidad viable y con espesores resolubles.
+- **Criterio de información:** BIC (o AIC); con ΔIC < 2 gana el más simple.
+- Se conserva el mayor k ≤ k estructural que (a) no esté en desventaja fuerte frente al
+  mejor (ΔIC ≤ 6, escala de Kass y Raftery) y (b) mejore el ajuste lo que exige el AIC
+  (Δφ ≥ 4 por capa añadida, 2 por parámetro) o reduzca χ² a la mitad (si no, es un escalón de la suavidad del multicapa, no
+  una capa que los datos vean). Se puede desactivar ("Número de capas según la estructura").
+
+Entre ajustes equivalentes (Δφ ≤ 0.25) gana el de **mínima estructura** Σ(Δ ln ρ)². El elegido se pule con la inversión de
+bloques de pyGIMLi si mejora el ajuste, y se funden capas contiguas casi iguales (salvo
+cuando k viene de la estructura).
 
 **Modo de bloques por profundidad (alternativo).** No usa Zohdy ni el multicapa para
 arrancar: el intervalo de profundidades de investigación de Edwards [z_e mín, z_e máx]
@@ -279,17 +297,14 @@ El modelo es:
 | 70–90 m | 300 | 3 |
 | > 90 m | 60 | 8 |
 
-**Curva exacta (S1).** El preprocesamiento no toca ningún dato. El BIC elige 6 capas:
-2 / 10.5 / 15.2 / 27.2 / 58.9 m con 10 / 59.7 / 4.7 / 473 / 14.9 / 64.7 Ω·m
-(χ² = 0.04, MAPE = 0.01 %, CV-MAPE = 0.03 %).
-- Las dos primeras interfaces salen exactas.
-- El conductor de 10–20 m conserva su conductancia (S = 4.7/4.7 ≈ 1.0 S, real 1.0 S) y el
-  resistivo de 20–40 m su resistencia transversal (T = 12.1 × 473 ≈ 5700 Ω·m², real 6000):
-  equivalencia S y T.
-- El candidato de 7 capas reproduce casi exactamente el modelo verdadero
-  (10 / 60 / 10 / 305 / 9.6 / 147 / 60 Ω·m), pero con datos exactos y piso de error de
-  0.1 % los dos tienen χ² < 1 y el BIC prefiere el más simple. Se puede revisar con
-  "Capas fijas = 7".
+**Curva exacta (S1).** El preprocesamiento no toca ningún dato. Se eligen 7 capas:
+2 / 10 / 20 / 39.7 / 67.5 / 112 m con 10 / 60 / 10 / 305 / 9.6 / 147 / 60 Ω·m
+(χ² ≈ 0, CV-MAPE ≈ 0 %).
+- Hasta 70 m recupera el modelo verdadero.
+- La capa resistiva de 70–90 m (bajo un conductor de S = 3 S) sale como 67–112 m a
+  147 Ω·m: equivalencia T (6000 contra 6600 Ω·m²).
+- El BIC solo prefería 6 capas (ΔBIC 5.7), pero el multicapa muestra esa estructura y la
+  séptima capa reduce χ² a casi cero, así que se conserva (ver "Número de capas").
 
 **Con `--ruido 0.10 --aberrantes --desplazamiento`.**
 - Detecta las lecturas aberrantes.
